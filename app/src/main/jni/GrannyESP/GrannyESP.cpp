@@ -197,6 +197,7 @@ static uintptr_t libil2cpp_base() {
 // Forward declarations untuk dipakai hook
 static inline void *read_ptr(void *obj, uintptr_t off);
 static void apply_big_head_to_visual();
+static void apply_big_head_maxY(void *aiInstance, bool checkUser);
 
 // Cari Transform dengan Y dunia tertinggi (kemungkinan kepala) rekursif.
 // depth dibatasi 8, children dibatasi 64 (sanity).
@@ -280,17 +281,8 @@ void hook_PlayerOnDisable(void *instance) {
 void (*old_EnemyFixedUpdate)(void *instance);
 void hook_EnemyFixedUpdate(void *instance) {
     g_enemyGrannyInstance = instance;
-    // Big head: langsung scale bila toggle aktif (tangani spawn setelah toggle)
-    if (g_bigHead && orig_get_parent && orig_set_localScale) {
-        void *eye = read_ptr(instance, OFF_ENEMY_EYE);
-        if (eye) {
-            void *head = orig_get_parent(eye, nullptr);
-            if (head) {
-                Vector3 s = { 2.5f, 2.5f, 2.5f };
-                orig_set_localScale(head, s, nullptr);
-            }
-        }
-    }
+    // Big head: max-Y dari Transform (tidak bergantung offset eye)
+    if (g_bigHead) apply_big_head_maxY(instance, false);
     if (old_EnemyFixedUpdate) old_EnemyFixedUpdate(instance);
 }
 
@@ -302,34 +294,8 @@ void hook_AIFixedUpdate(void *instance) {
         if (g_aiInstances[i] == instance) { isNew = false; break; }
     if (isNew && g_aiCount < MAX_AI_INSTANCES)
         g_aiInstances[g_aiCount++] = instance;
-    // Big head: scale bila toggle aktif dan instance BUKAN milik user
-    // (eye < 1m dari kamera = milik user, skip).
-    if (g_bigHead && isNew && orig_get_parent && orig_set_localScale &&
-        orig_get_position && orig_cam_get_main && orig_get_transform) {
-        void *eye = read_ptr(instance, OFF_AI_GRANNY_EYE);
-        if (eye) {
-            Vector3 eyeWp = orig_get_position(eye, nullptr);
-            void *cam = orig_cam_get_main(nullptr);
-            bool isUser = false;
-            if (cam) {
-                void *camT = orig_get_transform(cam, nullptr);
-                if (camT) {
-                    Vector3 camWp = orig_get_position(camT, nullptr);
-                    float dx = eyeWp.x - camWp.x;
-                    float dy = eyeWp.y - camWp.y;
-                    float dz = eyeWp.z - camWp.z;
-                    isUser = (dx*dx + dy*dy + dz*dz) < 1.0f;
-                }
-            }
-            if (!isUser) {
-                void *head = orig_get_parent(eye, nullptr);
-                if (head) {
-                    Vector3 s = { 2.5f, 2.5f, 2.5f };
-                    orig_set_localScale(head, s, nullptr);
-                }
-            }
-        }
-    }
+    // Big head: max-Y (filter user via jarak root, bukan eye)
+    if (g_bigHead && isNew) apply_big_head_maxY(instance, true);
     if (old_AIFixedUpdate) old_AIFixedUpdate(instance);
 }
 
@@ -352,6 +318,38 @@ void hook_MgrAwake(void *instance) {
     g_grannyManager = instance;
     LOGI("GrannyESP: manageGrannyAI tertangkap: %p", instance);
     if (old_MgrAwake) old_MgrAwake(instance);
+}
+
+// Terapkan big head via max-Y dari instance AI (tidak pakai offset eye).
+// checkUser=true untuk AIGrannyController (filter milik user via jarak root).
+static void apply_big_head_maxY(void *aiInstance, bool checkUser) {
+    if (!g_bigHead || !orig_get_transform || !orig_set_localScale) return;
+    if (!orig_get_position) return;
+    void *root = orig_get_transform(aiInstance, nullptr);
+    if (!root) return;
+    // Filter user: root < 1m dari kamera = milik user, skip
+    if (checkUser && orig_cam_get_main) {
+        Vector3 rootWp = orig_get_position(root, nullptr);
+        void *cam = orig_cam_get_main(nullptr);
+        if (cam) {
+            void *camT = orig_get_transform(cam, nullptr);
+            if (camT) {
+                Vector3 camWp = orig_get_position(camT, nullptr);
+                float dx = rootWp.x - camWp.x;
+                float dy = rootWp.y - camWp.y;
+                float dz = rootWp.z - camWp.z;
+                if (dx*dx + dy*dy + dz*dz < 1.0f) return;
+            }
+        }
+    }
+    float bestY = -1e9f;
+    void *bestT = nullptr;
+    find_highest_y(root, &bestY, &bestT, 0);
+    if (bestT && bestT != root) {
+        Vector3 s = { 2.5f, 2.5f, 2.5f };
+        orig_set_localScale(bestT, s, nullptr);
+        LOGI("GrannyESP: big head maxY OK (y=%.1f)", bestY);
+    }
 }
 
 // GrannyChangeTexture.Start: komponen visual PASTI nempel di badan Granny
