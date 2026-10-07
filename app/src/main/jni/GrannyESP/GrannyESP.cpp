@@ -72,17 +72,70 @@ static bool      g_threadRunning = false;
 static Il2CppApi g_api;
 
 // ---------------------------------------------------------------------------
-// 3. Resolve il2cpp API dari libil2cpp.so yang sudah dimuat game
+// 3. Resolve il2cpp API dari libil2cpp.so milik GAME.
+//
+// PENTING: kode ini HARUS berjalan di dalam proses game. Kalau mod dipasang
+// sebagai APK terpisah (proses sendiri), libil2cpp.so milik game tidak ada
+// di memori proses ini -> dlopen gagal. Itu sebabnya mod menu model LGL
+// harus di-merge ke dalam APK game (lihat CARA_PAKAI.md).
 // ---------------------------------------------------------------------------
-static bool init_il2cpp_api() {
+
+// Cari path lengkap ".../libil2cpp.so" di /proc/self/maps, lalu dlopen
+// pakai path itu. Lebih andal daripada dlopen("libil2cpp.so") biasa.
+static std::string find_lib_path_in_maps(const char *name) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return "";
+    char line[1024];
+    std::string res;
+    size_t namelen = strlen(name);
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = strchr(line, '/'); // path selalu diawali '/'
+        if (!p) continue;
+        std::string path(p);
+        while (!path.empty() &&
+               (path.back() == '\n' || path.back() == '\r' || path.back() == ' '))
+            path.pop_back();
+        // cocok hanya bila path BERAKHIR dengan nama lib yang dicari
+        if (path.size() >= namelen &&
+            path.compare(path.size() - namelen, namelen, name) == 0) {
+            res = path;
+            break;
+        }
+    }
+    fclose(f);
+    return res;
+}
+
+static bool init_il2cpp_api(std::string &err) {
     if (g_api.ok) return true;
-    void *handle = dlopen("libil2cpp.so", RTLD_NOLOAD | RTLD_NOW);
+    void *handle = nullptr;
+
+    // 1) path lengkap dari /proc/self/maps (paling andal)
+    std::string full = find_lib_path_in_maps("libil2cpp.so");
+    if (!full.empty()) {
+        handle = dlopen(full.c_str(), RTLD_NOW);
+        LOGI("GrannyESP: dlopen maps [%s] -> %p", full.c_str(), handle);
+    }
+    // 2) fallback: nama lib biasa
+    if (!handle) handle = dlopen("libil2cpp.so", RTLD_NOLOAD);
     if (!handle) handle = dlopen("libil2cpp.so", RTLD_NOW);
-    if (!handle) { LOGE("GrannyESP: libil2cpp.so tidak ditemukan"); return false; }
+
+    if (!handle) {
+        const char *dle = dlerror();
+        err = "dlopen libil2cpp.so gagal";
+        if (dle && *dle) { err += ": "; err += dle; }
+        err += "\n(mod harus di-merge ke APK game)";
+        LOGE("GrannyESP: %s", err.c_str());
+        return false;
+    }
 
     #define RESOLVE(name) \
         g_api.name = (decltype(g_api.name)) dlsym(handle, #name); \
-        if (!g_api.name) { LOGE("GrannyESP: dlsym gagal: %s", #name); return false; }
+        if (!g_api.name) { \
+            err = "dlsym gagal: "; err += #name; \
+            LOGE("GrannyESP: %s", err.c_str()); \
+            return false; \
+        }
 
     RESOLVE(domain_get);
     RESOLVE(domain_get_assemblies);
@@ -226,8 +279,9 @@ static void *monitor_thread(void *) {
         g_threadRunning = false;
         return nullptr;
     }
-    if (!init_il2cpp_api()) {
-        call_update_panel(env, "Granny\nil2cpp API gagal");
+    std::string err;
+    if (!init_il2cpp_api(err)) {
+        call_update_panel(env, ("Granny\n" + err).c_str());
     } else {
         while (g_enabled) {
             call_update_panel(env, build_panel_text().c_str());
