@@ -80,6 +80,7 @@ static jclass    g_espClass   = nullptr;
 static jmethodID g_espShow    = nullptr; // showEsp(Context)
 static jmethodID g_espHide    = nullptr; // hideEsp()
 static jmethodID g_espUpdate  = nullptr; // updateEsp(float,float,String)
+static jmethodID g_espMulti   = nullptr; // updateEspMulti(float[],float[],String[],int[])
 
 static volatile bool g_enabled = false;
 static volatile bool g_debug = false; // mode debug: tampilkan info mentah
@@ -332,6 +333,8 @@ static std::string build_panel_text() {
 // ---------------------------------------------------------------------------
 // Thread pemantau: update panel tiap 500 ms selama fitur aktif
 // ---------------------------------------------------------------------------
+static void draw_debug_candidates(JNIEnv *env); // forward decl
+
 static void *monitor_thread(void *) {
     JNIEnv *env = nullptr;
     if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
@@ -339,9 +342,13 @@ static void *monitor_thread(void *) {
         return nullptr;
     }
     while (g_enabled) {
-        // Mode debug menampilkan info mentah untuk diagnosis offset
-        call_update_panel(env, (g_debug ? build_debug_text()
-                                        : build_panel_text()).c_str());
+        // Mode debug: teks mentah + titik-titik kandidat di overlay
+        if (g_debug) {
+            call_update_panel(env, build_debug_text().c_str());
+            draw_debug_candidates(env);
+        } else {
+            call_update_panel(env, build_panel_text().c_str());
+        }
         for (int i = 0; i < 5 && g_enabled; i++) usleep(100000); // 500 ms
     }
     g_vm->DetachCurrentThread();
@@ -373,6 +380,91 @@ static void call_esp_update(JNIEnv *env, float x, float y, const char *name) {
     if (s) env->DeleteLocalRef(s);
 }
 
+// Gambar N titik kandidat sekaligus (mode debug). Setiap titik: {x, y, label, warna}.
+struct DbgPt { float x, y; const char *label; int color; };
+
+static void call_esp_multi(JNIEnv *env, const DbgPt *pts, int count) {
+    if (!g_espClass || !g_espMulti) return;
+    jfloatArray jxs = env->NewFloatArray(count);
+    jfloatArray jys = env->NewFloatArray(count);
+    jintArray jcs = env->NewIntArray(count);
+    jclass strCls = env->FindClass("java/lang/String");
+    jobjectArray jns = env->NewObjectArray(count, strCls, nullptr);
+    if (!jxs || !jys || !jcs || !jns) return;
+    for (int i = 0; i < count; i++) {
+        jfloat x = pts[i].x, y = pts[i].y;
+        jint c = pts[i].color;
+        env->SetFloatArrayRegion(jxs, i, 1, &x);
+        env->SetFloatArrayRegion(jys, i, 1, &y);
+        env->SetIntArrayRegion(jcs, i, 1, &c);
+        jstring s = env->NewStringUTF(pts[i].label ? pts[i].label : "");
+        env->SetObjectArrayElement(jns, i, s);
+        env->DeleteLocalRef(s);
+    }
+    env->CallStaticVoidMethod(g_espClass, g_espMulti, jxs, jys, jns, jcs);
+    env->DeleteLocalRef(jxs);
+    env->DeleteLocalRef(jys);
+    env->DeleteLocalRef(jcs);
+    env->DeleteLocalRef(jns);
+}
+
+// Overlay terlihat bila ESP aktif ATAU debug aktif
+static void update_overlay_visibility(JNIEnv *env) {
+    if (g_esp || g_debug) call_esp_show(env);
+    else call_esp_hide(env);
+}
+
+// Ambil main camera (cache 2 detik)
+static void *get_camera_cached() {
+    if (!orig_cam_get_main) return nullptr;
+    uint64_t now = now_ms();
+    if (!g_cachedCam || now - g_camTimeMs > 2000) {
+        g_cachedCam = orig_cam_get_main(nullptr);
+        g_camTimeMs = now;
+    }
+    return g_cachedCam;
+}
+
+// Mode debug: proyeksikan SEMUA kandidat transform jadi titik berlabel:
+//   T0  = get_transform(instance)  (merah)
+//   78  = field myTransform         (kuning)
+//   130 = field player              (cyan)
+//   140 = field playerPos            (hijau)
+//   90  = field target              (putih)
+// Titik yang menempel di badan Granny = sumber posisi yang benar.
+static void draw_debug_candidates(JNIEnv *env) {
+    void *granny = g_grannyInstance;
+    std::string warn;
+    if (!verify_instance(granny, warn) || !orig_get_transform || !orig_get_position ||
+        !orig_world_to_screen) {
+        call_esp_multi(env, nullptr, 0); // kosongkan
+        return;
+    }
+    void *cam = get_camera_cached();
+    if (!cam) { call_esp_multi(env, nullptr, 0); return; }
+
+    struct Cand { const char *label; void *t; int color; };
+    Cand cands[5] = {
+        { "T0",  orig_get_transform(granny, nullptr), (int) 0xFFFF5252 },
+        { "78",  read_ptr(granny, OFF_MY_TRANSFORM),  (int) 0xFFFFFF00 },
+        { "130", read_ptr(granny, OFF_PLAYER),        (int) 0xFF00FFFF },
+        { "140", read_ptr(granny, 0x140u),            (int) 0xFF00FF00 },
+        { "90",  read_ptr(granny, 0x90u),             (int) 0xFFFFFFFF },
+    };
+    DbgPt pts[5];
+    int n = 0;
+    for (int i = 0; i < 5; i++) {
+        if (!cands[i].t) continue;
+        Vector3 wp = orig_get_position(cands[i].t, nullptr);
+        Vector3 sp = orig_world_to_screen(cam, wp, nullptr);
+        if (sp.z < 1.0f) continue; // di belakang kamera
+        pts[n].x = sp.x; pts[n].y = sp.y;
+        pts[n].label = cands[i].label; pts[n].color = cands[i].color;
+        n++;
+    }
+    call_esp_multi(env, pts, n);
+}
+
 // Satu frame ESP: posisi dunia Granny -> WorldToScreenPoint -> update overlay.
 // x<0 / name null = sembunyikan (di belakang kamera / belum ada data).
 static void update_esp_frame(JNIEnv *env) {
@@ -386,15 +478,11 @@ static void update_esp_frame(JNIEnv *env) {
     void *tGranny = orig_get_transform(granny, nullptr);
     if (!tGranny) { call_esp_update(env, -1, -1, nullptr); return; }
 
-    uint64_t now = now_ms();
-    if (!g_cachedCam || now - g_camTimeMs > 2000) { // refresh kamera tiap 2 dtk
-        g_cachedCam = orig_cam_get_main(nullptr);
-        g_camTimeMs = now;
-    }
-    if (!g_cachedCam) { call_esp_update(env, -1, -1, nullptr); return; }
+    void *cam = get_camera_cached();
+    if (!cam) { call_esp_update(env, -1, -1, nullptr); return; }
 
     Vector3 wp = orig_get_position(tGranny, nullptr);          // posisi dunia
-    Vector3 sp = orig_world_to_screen(g_cachedCam, wp, nullptr); // -> koordinat layar
+    Vector3 sp = orig_world_to_screen(cam, wp, nullptr); // -> koordinat layar
     if (sp.z < 1.0f) { // z = depth; < 1 artinya di belakang kamera
         call_esp_update(env, -1, -1, nullptr);
         return;
@@ -409,7 +497,7 @@ static void *esp_thread(void *) {
         return nullptr;
     }
     while (g_esp) {
-        update_esp_frame(env);
+        if (!g_debug) update_esp_frame(env); // debug mengambil alih overlay
         usleep(100000); // ~10 fps, cukup mulus & hemat CPU
     }
     g_vm->DetachCurrentThread();
@@ -447,6 +535,8 @@ void GrannyESP_SetContext(JNIEnv *env, jobject ctx) {
         g_espHide   = env->GetStaticMethodID(g_espClass, "hideEsp", "()V");
         g_espUpdate = env->GetStaticMethodID(g_espClass, "updateEsp",
                                              "(FFLjava/lang/String;)V");
+        g_espMulti  = env->GetStaticMethodID(g_espClass, "updateEspMulti",
+                                             "([F[F[Ljava/lang/String;[I)V");
         env->DeleteLocalRef(espLocal);
     }
 }
@@ -460,20 +550,24 @@ void GrannyESP_SetESP(bool enabled) {
     if (g_vm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK) return;
 
     if (enabled) {
-        call_esp_show(env);
         g_espRunning = true;
         pthread_create(&g_espThread, nullptr, esp_thread, nullptr);
         LOGI("GrannyESP: ESP ON");
     } else {
         if (g_espRunning) pthread_join(g_espThread, nullptr);
-        call_esp_hide(env);
         LOGI("GrannyESP: ESP OFF");
     }
+    update_overlay_visibility(env);
 }
 
 // Dipanggil dari Changes() di Main.cpp (thread UI Java)
 void GrannyESP_SetDebug(bool enabled) {
+    if (!g_vm || enabled == g_debug) return;
     g_debug = enabled;
+
+    JNIEnv *env = nullptr;
+    if (g_vm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK) return;
+    update_overlay_visibility(env); // overlay ikut tampil saat debug ON
     LOGI("GrannyESP: debug %s", enabled ? "ON" : "OFF");
 }
 

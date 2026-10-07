@@ -11,13 +11,17 @@ import android.os.Looper;
 import android.view.View;
 import android.view.WindowManager;
 
+import java.util.ArrayList;
+import java.util.List;
+
 // ============================================================================
-// EspView - Overlay transparan untuk menggambar ESP (line + nametag).
-// Ditambah via WindowManager (MATCH_PARENT), tidak menangkap sentuhan.
-// Diupdate dari native (GrannyESP.cpp) lewat:
-//   showEsp(Context) -> tampilkan overlay
-//   hideEsp()        -> sembunyikan overlay
-//   updateEsp(x, y, name) -> update posisi + invalidate (redraw).
+// EspView - Overlay transparan untuk menggambar ESP.
+// Mendukung BANYAK titik sekaligus (untuk diagnosis: tiap kandidat transform
+// digambar dengan label & warna sendiri, mis. "T0", "78", "130"...).
+//   showEsp(Context)
+//   hideEsp()
+//   updateEsp(x, y, name)                        -> 1 titik merah (ESP utama)
+//   updateEspMulti(xs[], ys[], names[], colors[]) -> N titik (mode debug)
 // Koordinat x,y berasal dari Camera.WorldToScreenPoint (origin kiri-BAWAH),
 // jadi di onDraw dikonversi ke koordinat Android (origin kiri-ATAS).
 // ============================================================================
@@ -27,12 +31,14 @@ public class EspView extends View {
     private static WindowManager espWM;
     private static final Handler espUiHandler = new Handler(Looper.getMainLooper());
 
-    // Data ESP (satu entity: Granny). volatile karena ditulis dari UI thread
-    // via Handler dan dibaca di onDraw (UI thread juga) — aman.
-    private volatile boolean hasData = false;
-    private volatile float espX = -1;
-    private volatile float espY = -1;
-    private volatile String espName = null;
+    private static class EspItem {
+        float x, y;
+        String name;
+        int color;
+    }
+
+    // Daftar titik digambar; hanya diakses dari UI thread via Handler.
+    private final List<EspItem> items = new ArrayList<EspItem>();
 
     private final Paint linePaint = new Paint();
     private final Paint textPaint = new Paint();
@@ -42,18 +48,14 @@ public class EspView extends View {
         super(context);
         setWillNotDraw(false);
 
-        linePaint.setColor(Color.parseColor("#FF5252")); // merah
         linePaint.setStrokeWidth(4.0f);
         linePaint.setAntiAlias(true);
 
-        textPaint.setColor(Color.parseColor("#FFFFFF")); // putih
         textPaint.setTextSize(42.0f);
         textPaint.setAntiAlias(true);
         textPaint.setTextAlign(Paint.Align.CENTER);
-        // outline agar terbaca di atas game
         textPaint.setShadowLayer(6.0f, 0, 0, Color.parseColor("#CC000000"));
 
-        dotPaint.setColor(Color.parseColor("#FF5252"));
         dotPaint.setAntiAlias(true);
     }
 
@@ -82,34 +84,58 @@ public class EspView extends View {
         });
     }
 
-    // Dipanggil dari native saat toggle ESP OFF
+    // Dipanggil dari native saat toggle ESP OFF (dan debug OFF)
     public static void hideEsp() {
         espUiHandler.post(new Runnable() {
             @Override
             public void run() {
                 if (instance != null) {
-                    instance.hasData = false;
+                    instance.items.clear();
                     instance.setVisibility(View.GONE);
                 }
             }
         });
     }
 
-    // Dipanggil dari native tiap ~100 ms. x<0 atau name==null = sembunyikan.
+    // ESP utama: 1 titik merah. x<0 atau name==null = kosongkan.
     public static void updateEsp(final float x, final float y, final String name) {
         espUiHandler.post(new Runnable() {
             @Override
             public void run() {
                 if (instance == null) return;
-                if (x < 0 || name == null) {
-                    instance.hasData = false;
-                } else {
-                    instance.espX = x;
-                    instance.espY = y;
-                    instance.espName = name;
-                    instance.hasData = true;
+                instance.items.clear();
+                if (x >= 0 && name != null) {
+                    EspItem it = new EspItem();
+                    it.x = x; it.y = y; it.name = name;
+                    it.color = Color.parseColor("#FF5252");
+                    instance.items.add(it);
                 }
-                instance.invalidate(); // picu onDraw
+                instance.invalidate();
+            }
+        });
+    }
+
+    // Mode debug: N titik berlabel + berwarna.
+    public static void updateEspMulti(final float[] xs, final float[] ys,
+                                      final String[] names, final int[] colors) {
+        espUiHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (instance == null) return;
+                instance.items.clear();
+                if (xs != null && ys != null) {
+                    int n = Math.min(xs.length, ys.length);
+                    for (int i = 0; i < n; i++) {
+                        EspItem it = new EspItem();
+                        it.x = xs[i]; it.y = ys[i];
+                        it.name = (names != null && i < names.length && names[i] != null)
+                                ? names[i] : "";
+                        it.color = (colors != null && i < colors.length)
+                                ? colors[i] : Color.parseColor("#FF5252");
+                        instance.items.add(it);
+                    }
+                }
+                instance.invalidate();
             }
         });
     }
@@ -130,21 +156,29 @@ public class EspView extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
-        if (!hasData || espName == null) return;
 
         int w = getWidth();
         int h = getHeight();
-        float sx = espX;
-        float sy = h - espY; // Unity origin kiri-bawah -> Android kiri-atas
 
-        // Jangan gambar di luar layar
-        if (sx < -100 || sx > w + 100 || sy < -100 || sy > h + 100) return;
+        for (int i = 0; i < items.size(); i++) {
+            EspItem it = items.get(i);
+            float sx = it.x;
+            float sy = h - it.y; // Unity origin kiri-bawah -> Android kiri-atas
 
-        // 1. Garis dari tengah-atas layar ke NPC
-        canvas.drawLine(w / 2.0f, 0, sx, sy, linePaint);
-        // 2. Titik di posisi NPC
-        canvas.drawCircle(sx, sy, 10.0f, dotPaint);
-        // 3. Nametag di atas titik
-        canvas.drawText(espName, sx, sy - 36.0f, textPaint);
+            // Jangan gambar di luar layar
+            if (sx < -100 || sx > w + 100 || sy < -100 || sy > h + 100) continue;
+
+            linePaint.setColor(it.color);
+            dotPaint.setColor(it.color);
+
+            // 1. Garis dari tengah-atas layar ke titik
+            canvas.drawLine(w / 2.0f, 0, sx, sy, linePaint);
+            // 2. Titik
+            canvas.drawCircle(sx, sy, 10.0f, dotPaint);
+            // 3. Label di atas titik
+            if (it.name != null && it.name.length() > 0) {
+                canvas.drawText(it.name, sx, sy - 36.0f, textPaint);
+            }
+        }
     }
 }
