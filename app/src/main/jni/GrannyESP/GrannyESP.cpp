@@ -68,6 +68,7 @@ static jmethodID g_midUpdate = nullptr;
 static jmethodID g_midHide   = nullptr;
 
 static volatile bool g_enabled = false;
+static volatile bool g_debug = false; // mode debug: tampilkan info mentah
 static pthread_t g_thread;
 static bool      g_threadRunning = false;
 
@@ -175,13 +176,51 @@ static inline void *read_ptr(void *obj, uintptr_t off) {
     return p;
 }
 
+// Baca nama class asli dari sebuah object il2cpp:
+//   obj[0]            = Il2CppClass* klass
+//   klass[0x10]       = const char* name   (layout Il2CppClass, stabil)
+static const char *get_class_name(void *obj) {
+    if (!obj) return "-";
+    void *klass = nullptr;
+    memcpy(&klass, obj, sizeof(klass));
+    if (!klass) return "-";
+    const char *name = nullptr;
+    memcpy(&name, (char *) klass + 0x10, sizeof(name));
+    if (!name) return "-";
+    for (int i = 0; i < 64; i++) { // sanity: harus string ASCII printable
+        char c = name[i];
+        if (c == '\0') return name;
+        if (c < 32 || c > 126) return "?";
+    }
+    return "?";
+}
+
+// Panel debug: nama class + status null(0)/non-null(1) tiap offset kandidat
+static std::string build_debug_text() {
+    char buf[256];
+    void *granny = g_grannyInstance;
+    if (!granny) { snprintf(buf, sizeof(buf), "DBG Granny\ninstance: null"); return buf; }
+    auto nz = [](void *p) -> const char * { return p ? "1" : "0"; };
+    snprintf(buf, sizeof(buf), "DBG Granny\ncls=%s\n78:%s 130:%s\n140:%s 90:%s",
+             get_class_name(granny),
+             nz(read_ptr(granny, OFF_MY_TRANSFORM)),
+             nz(read_ptr(granny, OFF_PLAYER)),
+             nz(read_ptr(granny, 0x140u)),   // playerPos
+             nz(read_ptr(granny, 0x90u)));   // target
+    return buf;
+}
+
 static std::string build_panel_text() {
     void *granny = g_grannyInstance; // snapshot sekali
     if (!granny) return "Granny\nbelum spawn";
     if (!orig_get_position) return "Granny\nhook belum siap";
 
     void *tGranny = read_ptr(granny, OFF_MY_TRANSFORM);
+    // Posisi pemain: coba player(0x130) -> playerPos(0x140) -> target(0x90),
+    // pakai yang pertama non-null (field target bisa null tergantung state AI).
     void *tPlayer = read_ptr(granny, OFF_PLAYER);
+    if (!tPlayer) tPlayer = read_ptr(granny, 0x140u);
+    if (!tPlayer) tPlayer = read_ptr(granny, 0x90u);
     if (!tGranny || !tPlayer) return "Granny\nmenunggu data...";
 
     Vector3 pg = orig_get_position(tGranny);
@@ -207,7 +246,9 @@ static void *monitor_thread(void *) {
         return nullptr;
     }
     while (g_enabled) {
-        call_update_panel(env, build_panel_text().c_str());
+        // Mode debug menampilkan info mentah untuk diagnosis offset
+        call_update_panel(env, (g_debug ? build_debug_text()
+                                        : build_panel_text()).c_str());
         for (int i = 0; i < 5 && g_enabled; i++) usleep(100000); // 500 ms
     }
     g_vm->DetachCurrentThread();
@@ -235,6 +276,12 @@ void GrannyESP_SetContext(JNIEnv *env, jobject ctx) {
         g_midHide   = env->GetStaticMethodID(g_menuClass, "hideGrannyPanel", "()V");
         env->DeleteLocalRef(local);
     }
+}
+
+// Dipanggil dari Changes() di Main.cpp (thread UI Java)
+void GrannyESP_SetDebug(bool enabled) {
+    g_debug = enabled;
+    LOGI("GrannyESP: debug %s", enabled ? "ON" : "OFF");
 }
 
 // Dipanggil dari Changes() di Main.cpp (thread UI Java)

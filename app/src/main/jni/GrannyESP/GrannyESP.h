@@ -31,6 +31,10 @@ void GrannyESP_InstallHooks();
 // diubah. true = tampilkan panel & mulai pantau, false = sembunyikan.
 void GrannyESP_SetEnabled(bool enabled);
 
+// Toggle "Debug Info Granny": panel menampilkan nama class asli instance
+// + status null/non-null field kandidat (untuk diagnosis offset).
+void GrannyESP_SetDebug(bool enabled);
+
 #ifdef __cplusplus
 }
 #endif
