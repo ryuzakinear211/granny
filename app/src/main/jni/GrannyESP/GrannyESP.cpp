@@ -9,19 +9,20 @@
 //
 // ALUR:
 //   1. Saat libil2cpp.so dimuat -> GrannyESP_InstallHooks()
-//        - Hook AIGrannyController.FixedUpdate -> simpan instance Granny
-//          setiap physics frame ke g_grannyInstance.
-//        - Hook AIGrannyController.OnDisable -> bersihkan cache saat Granny
-//          nonaktif/destroy (cegah dangling pointer).
-//        - Resolve UnityEngine.Transform.get_position sebagai function
-//          pointer biasa -> panggil langsung, tanpa il2cpp API.
+//        - Hook playerController.Start -> kumpulkan SEMUA pemain.
+//          Role dibaca tiap frame via playerController.isGranny (0x39B).
+//        - Hook playerController.OnDisable -> keluarkan dari daftar.
+//        - Hook manageGrannyAI.Awake -> tangkap manager NPC Granny
+//          (untuk mode PvE; NPC via returnAIGranny()).
+//        - Resolve UnityEngine.Transform.get_position, Component.get_transform,
+//          GameObject.get_transform, Camera.get_main, Camera.WorldToScreenPoint
+//          sebagai function pointer biasa -> panggil langsung, tanpa il2cpp API.
 //   2. Toggle ON -> tampilkan panel + thread pemantau (500 ms):
-//        posisi Granny dari field grannyEye(0x80) milik instance (Transform di
-//        kepala Granny) via get_position(), jarak Euclidean ke pemain,
-//        status seePlayer(0x1D8).
+//        kumpulkan posisi semua Granny (NPC + pemain isGranny),
+//        jarak Euclidean ke kamera (user).
 //   3. Toggle OFF -> hentikan thread, sembunyikan panel.
-//   4. Toggle "Enable ESP" -> overlay transparan: garis + titik + nametag
-//        "Granny" di posisi kepala (grannyEye), update ~10 fps.
+//   4. Toggle "Enable ESP" -> overlay transparan multi-target: garis + titik +
+//        nametag "Granny" untuk SETIAP Granny yang terdeteksi, update ~10 fps.
 //
 // !!! PENTING: RVA & offset di bawah ini WAJIB dari dump.cs milik VERSI GAME
 // YANG SAMA PERSIS dengan yang terpasang di HP. Beda versi -> hook salah
@@ -55,20 +56,19 @@
 // CATATAN ABI il2cpp: setiap method managed punya parameter tersembunyi
 // terakhir `const MethodInfo* method`. Kita pass NULL (tolerated untuk
 // method-method sederhana ini) — JANGAN biarkan register terisi sampah.
-#define RVA_FIXEDUPDATE   0x1FE50D4u  // AIGrannyController.FixedUpdate
-#define RVA_ONDISABLE     0x1FE447Cu  // AIGrannyController.OnDisable
 #define RVA_GET_POSITION  0x3FF2004u  // UnityEngine.Transform.get_position
 #define RVA_GET_TRANSFORM 0x3FE0348u  // UnityEngine.Component.get_transform
 #define RVA_CAM_GET_MAIN  0x3FA83A0u  // UnityEngine.Camera.get_main()
 #define RVA_W2S           0x3FA8118u  // UnityEngine.Camera.WorldToScreenPoint(Vector3)
 #define RVA_GO_GET_TRANSFORM 0x3FE3E70u // UnityEngine.GameObject.get_transform
-// --- manageGrannyAI: manager NPC Granny (punya referensi langsung!) ---
+// --- manageGrannyAI: manager NPC Granny (mode PvE) ---
 #define RVA_MGR_AWAKE         0x1FF6F44u // manageGrannyAI.Awake
 #define RVA_MGR_RETURN_GRANNY 0x1FF6F3Cu // manageGrannyAI.returnAIGranny() -> GameObject*
-// --- EnemyAIGranny: class AI Granny alternatif (offset field BERBEDA!) ---
-#define RVA_ENEMY_FIXEDUPDATE 0x1F4AB00u // EnemyAIGranny.FixedUpdate
-#define OFF_ENEMY_EYE         0x28u      // EnemyAIGranny.grannyEye (Transform)
-#define OFF_ENEMY_MYTRANSFORM 0x20u      // EnemyAIGranny.myTransform (Transform)
+// --- playerController: SEMUA pemain pakai class ini; role via isGranny ---
+#define RVA_PLAYER_START     0x201C034u // playerController.Start
+#define RVA_PLAYER_ONDISABLE 0x201B550u // playerController.OnDisable
+#define OFF_PC_ISGRANNY      0x39Bu     // playerController.isGranny (bool)
+#define MAX_PLAYERS          16
 
 // --- Field offset AIGrannyController (dump.cs) ---
 #define OFF_MY_TRANSFORM  0x78u
@@ -92,21 +92,20 @@ static jclass    g_espClass   = nullptr;
 static jmethodID g_espShow    = nullptr; // showEsp(Context)
 static jmethodID g_espHide    = nullptr; // hideEsp()
 static jmethodID g_espUpdate  = nullptr; // updateEsp(float,float,String)
+static jmethodID g_espMulti   = nullptr; // updateEspMulti(float[],float[],String[],int[])
 
 static volatile bool g_enabled = false;
 static volatile bool g_debug = false; // mode debug: tampilkan info mentah
 static pthread_t g_thread;
 static bool      g_threadRunning = false;
 
-// Instance Granny yang sedang hidup (di-cache dari hook FixedUpdate)
-// CATATAN: di game ini AIGrannyController bisa nempel di karakter USER sendiri
-// (terbukti: grannyEye-nya menempel di kamera). Instance milik user di-skip
-// via is_own_instance(); NPC asli dicari via manageGrannyAI / EnemyAIGranny.
-static void *g_grannyInstance = nullptr;
-// manageGrannyAI instance (punya referensi langsung ke GameObject NPC Granny)
+// Daftar SEMUA playerController (semua pemain pakai class ini).
+// Role dibaca tiap frame via isGranny (0x39B): true = Granny/seeker.
+static void *g_players[MAX_PLAYERS];
+static int g_playerCount = 0;
+// manageGrannyAI instance (punya referensi langsung ke GameObject NPC Granny,
+// untuk mode PvE / Story)
 static void *g_grannyManager = nullptr;
-// EnemyAIGranny instance (class AI alternatif)
-static void *g_enemyGrannyInstance = nullptr;
 // Function pointer (semua dipanggil dengan method=NULL eksplisit)
 // UnityEngine.Transform.get_position()
 static Vector3 (*orig_get_position)(void *transform, void *method) = nullptr;
@@ -160,16 +159,30 @@ static uintptr_t libil2cpp_base() {
 // ---------------------------------------------------------------------------
 // Hook callbacks
 // ---------------------------------------------------------------------------
-void (*old_FixedUpdate)(void *instance);
-void hook_FixedUpdate(void *instance) {
-    g_grannyInstance = instance; // Granny hidup & aktif -> simpan
-    if (old_FixedUpdate) old_FixedUpdate(instance);
+// playerController.Start: setiap pemain yang spawn lewat sini.
+// Kumpulkan SEMUA; role (isGranny) dibaca tiap frame karena bisa di-set
+// setelah Start.
+void (*old_PlayerStart)(void *instance);
+void hook_PlayerStart(void *instance) {
+    for (int i = 0; i < g_playerCount; i++)
+        if (g_players[i] == instance) { if (old_PlayerStart) old_PlayerStart(instance); return; }
+    if (g_playerCount < MAX_PLAYERS) {
+        g_players[g_playerCount++] = instance;
+        LOGI("GrannyESP: player tertangkap: %p (total %d)", instance, g_playerCount);
+    }
+    if (old_PlayerStart) old_PlayerStart(instance);
 }
 
-void (*old_OnDisable)(void *instance);
-void hook_OnDisable(void *instance) {
-    if (g_grannyInstance == instance) g_grannyInstance = nullptr; // cegah dangling
-    if (old_OnDisable) old_OnDisable(instance);
+// playerController.OnDisable: keluarkan dari daftar (cegah dangling)
+void (*old_PlayerOnDisable)(void *instance);
+void hook_PlayerOnDisable(void *instance) {
+    for (int i = 0; i < g_playerCount; i++) {
+        if (g_players[i] == instance) {
+            g_players[i] = g_players[--g_playerCount];
+            break;
+        }
+    }
+    if (old_PlayerOnDisable) old_PlayerOnDisable(instance);
 }
 
 // manageGrannyAI.Awake: tangkap manager NPC Granny
@@ -178,13 +191,6 @@ void hook_MgrAwake(void *instance) {
     g_grannyManager = instance;
     LOGI("GrannyESP: manageGrannyAI tertangkap: %p", instance);
     if (old_MgrAwake) old_MgrAwake(instance);
-}
-
-// EnemyAIGranny.FixedUpdate: tangkap instance AI Granny alternatif
-void (*old_EnemyFixedUpdate)(void *instance);
-void hook_EnemyFixedUpdate(void *instance) {
-    g_enemyGrannyInstance = instance;
-    if (old_EnemyFixedUpdate) old_EnemyFixedUpdate(instance);
 }
 
 static void install_hook(void *addr, void *replace, void **orig) {
@@ -206,14 +212,12 @@ void GrannyESP_InstallHooks() {
         return;
     }
 
-    install_hook((void *) (base + RVA_FIXEDUPDATE),
-                 (void *) hook_FixedUpdate, (void **) &old_FixedUpdate);
-    install_hook((void *) (base + RVA_ONDISABLE),
-                 (void *) hook_OnDisable, (void **) &old_OnDisable);
+    install_hook((void *) (base + RVA_PLAYER_START),
+                 (void *) hook_PlayerStart, (void **) &old_PlayerStart);
+    install_hook((void *) (base + RVA_PLAYER_ONDISABLE),
+                 (void *) hook_PlayerOnDisable, (void **) &old_PlayerOnDisable);
     install_hook((void *) (base + RVA_MGR_AWAKE),
                  (void *) hook_MgrAwake, (void **) &old_MgrAwake);
-    install_hook((void *) (base + RVA_ENEMY_FIXEDUPDATE),
-                 (void *) hook_EnemyFixedUpdate, (void **) &old_EnemyFixedUpdate);
     orig_returnAIGranny =
         (void *(*)(void *, void *)) (base + RVA_MGR_RETURN_GRANNY);
     orig_go_get_transform =
@@ -227,9 +231,10 @@ void GrannyESP_InstallHooks() {
     orig_world_to_screen =
         (Vector3 (*)(void *, Vector3, void *)) (base + RVA_W2S);
 
-    LOGI("GrannyESP: hooks terpasang (FixedUpdate=%p OnDisable=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
-         (void *) (base + RVA_FIXEDUPDATE),
-         (void *) (base + RVA_ONDISABLE),
+    LOGI("GrannyESP: hooks terpasang (playerStart=%p playerOnDisable=%p mgrAwake=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
+         (void *) (base + RVA_PLAYER_START),
+         (void *) (base + RVA_PLAYER_ONDISABLE),
+         (void *) (base + RVA_MGR_AWAKE),
          (void *) (base + RVA_GET_POSITION),
          (void *) (base + RVA_GET_TRANSFORM),
          (void *) (base + RVA_CAM_GET_MAIN),
@@ -310,13 +315,6 @@ static bool verify_instance(void *granny, std::string &warnMsg) {
     return true;
 }
 
-// Hasil resolusi posisi Granny
-struct GrannyPos {
-    Vector3 wp;
-    const char *src; // "NPC" | "EYE2" | "EYE" | "78" | "T0" | "?"
-    bool ok;
-};
-
 // Posisi kamera (== posisi user) untuk filter & jarak
 static void *get_camera_cached(); // forward decl
 static bool get_camera_pos(Vector3 *outWp) {
@@ -328,36 +326,23 @@ static bool get_camera_pos(Vector3 *outWp) {
     return true;
 }
 
-// True bila instance AIGrannyController ini milik USER sendiri (bukan NPC):
-// grannyEye-nya menempel di kamera (< 1m). Instance milik user di-skip
-// agar ESP tidak melacak diri sendiri.
-static bool is_own_instance(void *aiInstance) {
-    if (!aiInstance || !orig_get_position) return false;
-    void *tEye = read_ptr(aiInstance, OFF_GRANNY_EYE);
-    if (!tEye) return false;
-    Vector3 eyeWp = orig_get_position(tEye, nullptr);
-    Vector3 camWp;
-    if (!get_camera_pos(&camWp)) return false;
-    float dx = eyeWp.x - camWp.x, dy = eyeWp.y - camWp.y, dz = eyeWp.z - camWp.z;
-    return (dx*dx + dy*dy + dz*dz) < 1.0f; // < 1m dari kamera = milik user
-}
-
 // Sanity check posisi dunia (tolak NaN / nilai absurd dari pointer basi)
 static bool sane_pos(Vector3 wp) {
     if (wp.x != wp.x || wp.y != wp.y || wp.z != wp.z) return false; // NaN
     return fabsf(wp.x) < 10000 && fabsf(wp.y) < 10000 && fabsf(wp.z) < 10000;
 }
 
-// Posisi Granny (NPC). Prioritas:
-//   NPC  = via manageGrannyAI.returnAIGranny() -> GameObject NPC langsung
-//          dari manager game (paling akurat, tak peduli class AI-nya apa)
-//   EYE2 = EnemyAIGranny.grannyEye (0x28) — class AI alternatif
-//   EYE  = AIGrannyController.grannyEye (0x80), TAPI hanya bila BUKAN
-//          milik user sendiri (filter via is_own_instance)
-//   78/T0= fallback dari instance AI yang sama (juga difilter)
-static GrannyPos resolve_granny_pos() {
-    GrannyPos r = { {0, 0, 0}, "?", false };
-    if (!orig_get_position) return r;
+#define MAX_GRANNIES 8
+
+// Kumpulkan SEMUA Granny yang terlihat oleh ESP:
+//   1. NPC via manageGrannyAI.returnAIGranny() (mode PvE / Story)
+//   2. Pemain dengan playerController.isGranny==true (mode PvP; 2 seeker)
+// isGranny dibaca TIAP PANGGIL (bukan sekali saat Start) karena bisa di-set
+// setelah Start. Diri sendiri di-skip (jarak < 1m dari kamera).
+// Return: jumlah posisi yang terkumpul (0..maxOut).
+static int collect_grannies(Vector3 *outPos, int maxOut) {
+    int n = 0;
+    if (!orig_get_position || maxOut <= 0) return 0;
 
     // 1. NPC langsung dari manager
     if (g_grannyManager && orig_returnAIGranny && orig_go_get_transform) {
@@ -366,101 +351,84 @@ static GrannyPos resolve_granny_pos() {
             void *t = orig_go_get_transform(go, nullptr);
             if (t) {
                 Vector3 wp = orig_get_position(t, nullptr);
-                if (sane_pos(wp)) {
-                    r.wp = wp; r.src = "NPC"; r.ok = true; return r;
-                }
+                if (sane_pos(wp) && n < maxOut) outPos[n++] = wp;
             }
         }
     }
 
-    // 2. EnemyAIGranny (offset grannyEye 0x28!)
-    if (g_enemyGrannyInstance) {
-        void *t = read_ptr(g_enemyGrannyInstance, OFF_ENEMY_EYE);
-        if (t) {
-            Vector3 wp = orig_get_position(t, nullptr);
-            if (sane_pos(wp)) { r.wp = wp; r.src = "EYE2"; r.ok = true; return r; }
+    // 2. Pemain Granny (playerController.isGranny)
+    if (!orig_get_transform) return n;
+    // Snapshot cepat daftar pemain untuk hindari race dengan hook thread
+    void *snap[MAX_PLAYERS];
+    int sc = g_playerCount < MAX_PLAYERS ? g_playerCount : MAX_PLAYERS;
+    for (int i = 0; i < sc; i++) snap[i] = g_players[i];
+    Vector3 camWp;
+    bool haveCam = get_camera_pos(&camWp);
+    for (int i = 0; i < sc && n < maxOut; i++) {
+        void *pc = snap[i];
+        if (!pc) continue;
+        bool isGranny = false;
+        memcpy(&isGranny, (char *) pc + OFF_PC_ISGRANNY, 1);
+        if (!isGranny) continue;
+        void *t = orig_get_transform(pc, nullptr); // playerController = Component
+        if (!t) continue;
+        Vector3 wp = orig_get_position(t, nullptr);
+        if (!sane_pos(wp)) continue;
+        if (haveCam) { // skip diri sendiri
+            float dx = wp.x - camWp.x, dy = wp.y - camWp.y, dz = wp.z - camWp.z;
+            if (dx*dx + dy*dy + dz*dz < 1.0f) continue;
         }
-        t = read_ptr(g_enemyGrannyInstance, OFF_ENEMY_MYTRANSFORM);
-        if (t) {
-            Vector3 wp = orig_get_position(t, nullptr);
-            if (sane_pos(wp)) { r.wp = wp; r.src = "E78"; r.ok = true; return r; }
-        }
+        outPos[n++] = wp;
     }
-
-    // 3. AIGrannyController — skip bila milik user sendiri
-    void *granny = g_grannyInstance;
-    if (granny && !is_own_instance(granny)) {
-        void *t = read_ptr(granny, OFF_GRANNY_EYE);
-        if (t) {
-            Vector3 wp = orig_get_position(t, nullptr);
-            if (sane_pos(wp)) { r.wp = wp; r.src = "EYE"; r.ok = true; return r; }
-        }
-        t = read_ptr(granny, OFF_MY_TRANSFORM);
-        if (t) {
-            Vector3 wp = orig_get_position(t, nullptr);
-            if (sane_pos(wp)) { r.wp = wp; r.src = "78"; r.ok = true; return r; }
-        }
-        if (orig_get_transform) {
-            t = orig_get_transform(granny, nullptr);
-            if (t) {
-                Vector3 wp = orig_get_position(t, nullptr);
-                if (sane_pos(wp)) { r.wp = wp; r.src = "T0"; r.ok = true; return r; }
-            }
-        }
-    }
-    return r;
+    return n;
 }
 
-// Panel debug: status manager/NPC/instance + sumber posisi + koordinat.
+// Panel debug: status manager/NPC/pemain + jumlah Granny + koordinat pertama.
 static std::string build_debug_text() {
     char buf[512];
-    // Cek NPC via manager (tanpa resolve penuh, biar ringan)
     const char *npcState = "-";
     if (g_grannyManager && orig_returnAIGranny) {
         npcState = orig_returnAIGranny(g_grannyManager, nullptr) ? "1" : "0";
     }
-    int n = snprintf(buf, sizeof(buf), "DBG Granny\nmgr:%s npc:%s\nenemy:%s own:%s",
+    Vector3 wps[MAX_GRANNIES];
+    int ng = collect_grannies(wps, MAX_GRANNIES);
+    int n = snprintf(buf, sizeof(buf), "DBG Granny\nmgr:%s npc:%s\nplayers:%d granny:%d",
              g_grannyManager ? "1" : "0",
              npcState,
-             g_enemyGrannyInstance ? "1" : "0",
-             (g_grannyInstance && is_own_instance(g_grannyInstance)) ? "1" : "0");
+             g_playerCount, ng);
     if (n > 0 && (size_t) n < sizeof(buf) - 128 &&
-        orig_cam_get_main && orig_world_to_screen) {
-        GrannyPos gp = resolve_granny_pos();
-        if (gp.ok) {
-            void *cam = orig_cam_get_main(nullptr);
-            if (cam) {
-                Vector3 sp = orig_world_to_screen(cam, gp.wp, nullptr);
-                snprintf(buf + n, sizeof(buf) - n,
-                         "\nsrc=%s\nw=%.0f,%.0f,%.0f\ns=%.0f,%.0f,%.0f",
-                         gp.src, gp.wp.x, gp.wp.y, gp.wp.z, sp.x, sp.y, sp.z);
-            } else {
-                snprintf(buf + n, sizeof(buf) - n,
-                         "\nsrc=%s\nw=%.0f,%.0f,%.0f\ncam=null",
-                         gp.src, gp.wp.x, gp.wp.y, gp.wp.z);
-            }
+        orig_cam_get_main && orig_world_to_screen && ng > 0) {
+        void *cam = orig_cam_get_main(nullptr);
+        if (cam) {
+            Vector3 sp = orig_world_to_screen(cam, wps[0], nullptr);
+            snprintf(buf + n, sizeof(buf) - n,
+                     "\nw=%.0f,%.0f,%.0f\ns=%.0f,%.0f,%.0f",
+                     wps[0].x, wps[0].y, wps[0].z, sp.x, sp.y, sp.z);
         } else {
-            snprintf(buf + n, sizeof(buf) - n, "\nsrc=?\nno pos");
+            snprintf(buf + n, sizeof(buf) - n,
+                     "\nw=%.0f,%.0f,%.0f\ncam=null",
+                     wps[0].x, wps[0].y, wps[0].z);
         }
     }
     return buf;
 }
 
 static std::string build_panel_text() {
-    // Posisi NPC Granny dari resolver (prioritas: manager NPC -> EnemyAIGranny
-    // -> AIGrannyController yang bukan milik user).
-    GrannyPos gp = resolve_granny_pos();
-    // Posisi user = posisi kamera.
+    // Semua Granny yang terdeteksi (NPC via manager + pemain isGranny).
+    Vector3 wps[MAX_GRANNIES];
+    int n = collect_grannies(wps, MAX_GRANNIES);
     Vector3 userWp;
-    if (!gp.ok || !get_camera_pos(&userWp)) return "Granny\nmenunggu data...";
+    if (n == 0 || !get_camera_pos(&userWp)) return "Granny\nmenunggu data...";
 
-    Vector3 pg = gp.wp;
-    float dx = pg.x - userWp.x, dy = pg.y - userWp.y, dz = pg.z - userWp.z;
-    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-
+    // Jarak ke Granny terdekat
+    float best = 1e9f;
+    for (int i = 0; i < n; i++) {
+        float dx = wps[i].x - userWp.x, dy = wps[i].y - userWp.y, dz = wps[i].z - userWp.z;
+        float d = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (d < best) best = d;
+    }
     char buf[128];
-    snprintf(buf, sizeof(buf), "Granny (%s)\nJarak: %.1f m",
-             gp.src, dist);
+    snprintf(buf, sizeof(buf), "Granny x%d\nJarak: %.1f m", n, best);
     return buf;
 }
 
@@ -508,6 +476,34 @@ static void call_esp_update(JNIEnv *env, float x, float y, const char *name) {
     if (s) env->DeleteLocalRef(s);
 }
 
+// Multi-titik untuk ESP multi-target (tiap Granny satu titik + nametag)
+struct DbgPt { float x, y; const char *label; int color; };
+
+static void call_esp_multi(JNIEnv *env, const DbgPt *pts, int count) {
+    if (!g_espClass || !g_espMulti) return;
+    jfloatArray jxs = env->NewFloatArray(count);
+    jfloatArray jys = env->NewFloatArray(count);
+    jintArray jcs = env->NewIntArray(count);
+    jclass strCls = env->FindClass("java/lang/String");
+    jobjectArray jns = env->NewObjectArray(count, strCls, nullptr);
+    if (!jxs || !jys || !jcs || !jns) return;
+    for (int i = 0; i < count; i++) {
+        jfloat x = pts[i].x, y = pts[i].y;
+        jint c = pts[i].color;
+        env->SetFloatArrayRegion(jxs, i, 1, &x);
+        env->SetFloatArrayRegion(jys, i, 1, &y);
+        env->SetIntArrayRegion(jcs, i, 1, &c);
+        jstring s = env->NewStringUTF(pts[i].label ? pts[i].label : "");
+        env->SetObjectArrayElement(jns, i, s);
+        env->DeleteLocalRef(s);
+    }
+    env->CallStaticVoidMethod(g_espClass, g_espMulti, jxs, jys, jns, jcs);
+    env->DeleteLocalRef(jxs);
+    env->DeleteLocalRef(jys);
+    env->DeleteLocalRef(jcs);
+    env->DeleteLocalRef(jns);
+}
+
 // Ambil main camera (cache 2 detik)
 static void *get_camera_cached() {
     if (!orig_cam_get_main) return nullptr;
@@ -519,29 +515,28 @@ static void *get_camera_cached() {
     return g_cachedCam;
 }
 
-// Satu frame ESP: posisi dunia Granny (via resolver) -> WorldToScreenPoint.
-// x<0 / name null = sembunyikan (di belakang kamera / belum ada data).
+// Satu frame ESP multi-target: semua Granny -> WorldToScreenPoint -> overlay.
+// Titik disembunyikan hanya bila di belakang kamera (z <= 0).
 static void update_esp_frame(JNIEnv *env) {
     if (!orig_cam_get_main || !orig_world_to_screen) {
-        call_esp_update(env, -1, -1, nullptr);
+        call_esp_multi(env, nullptr, 0);
         return;
     }
-    GrannyPos gp = resolve_granny_pos();
-    if (!gp.ok) { call_esp_update(env, -1, -1, nullptr); return; }
-
+    Vector3 wps[MAX_GRANNIES];
+    int n = collect_grannies(wps, MAX_GRANNIES);
     void *cam = get_camera_cached();
-    if (!cam) { call_esp_update(env, -1, -1, nullptr); return; }
+    if (!cam || n == 0) { call_esp_multi(env, nullptr, 0); return; }
 
-    Vector3 sp = orig_world_to_screen(cam, gp.wp, nullptr); // -> koordinat layar
-    // z = jarak dari kamera (meter). Sembunyikan HANYA bila di belakang
-    // kamera (z <= 0; x/y hasil proyeksi jadi terbalik/mirror).
-    // JANGAN pakai threshold > 0 (mis. 1.0): Granny yang dekat pemain
-    // (< 1 m, wajar saat mengejar) ikut tersembunyi -> ESP kedip muncul-hilang.
-    if (sp.z <= 0.0f) {
-        call_esp_update(env, -1, -1, nullptr);
-        return;
+    DbgPt pts[MAX_GRANNIES];
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        Vector3 sp = orig_world_to_screen(cam, wps[i], nullptr);
+        if (sp.z <= 0.0f) continue; // di belakang kamera -> skip
+        pts[m].x = sp.x; pts[m].y = sp.y;
+        pts[m].label = "Granny"; pts[m].color = (int) 0xFFFF5252;
+        m++;
     }
-    call_esp_update(env, sp.x, sp.y, "Granny");
+    call_esp_multi(env, pts, m);
 }
 
 static void *esp_thread(void *) {
@@ -589,6 +584,8 @@ void GrannyESP_SetContext(JNIEnv *env, jobject ctx) {
         g_espHide   = env->GetStaticMethodID(g_espClass, "hideEsp", "()V");
         g_espUpdate = env->GetStaticMethodID(g_espClass, "updateEsp",
                                              "(FFLjava/lang/String;)V");
+        g_espMulti  = env->GetStaticMethodID(g_espClass, "updateEspMulti",
+                                             "([F[F[Ljava/lang/String;[I)V");
         env->DeleteLocalRef(espLocal);
     }
 }
