@@ -1,19 +1,29 @@
 // ============================================================================
-// GrannyESP.cpp - Implementasi fitur "Show NPC Granny" + panel status jarak
+// GrannyESP.cpp - Fitur "Show NPC Granny" + panel status jarak
+// PENDEKATAN HOOK (tanpa il2cpp API)
 //
-// ALUR BELAJAR (baca dari atas ke bawah):
-//   GrannyESP_SetEnabled(true)
-//     -> tampilkan panel (Menu.showGrannyPanel)
-//     -> jalankan monitor_thread
-//        -> tiap 500 ms: cari AIGrannyController -> baca posisi ->
-//           hitung jarak -> update panel (Menu.updateGrannyPanel)
-//   GrannyESP_SetEnabled(false)
-//     -> hentikan thread -> sembunyikan panel (Menu.hideGrannyPanel)
+// Kenapa hook? Sebagian game men-strip simbol export il2cpp_* dari
+// libil2cpp.so (anti-mod), sehingga dlsym("il2cpp_domain_get") gagal.
+// Cara ini tidak butuh SATU PUN simbol export: kita hook langsung sebuah
+// method game memakai alamat = base libil2cpp.so + RVA dari dump.cs.
 //
-// OFFSET (dari dump.cs, AIGrannyController, TypeDefIndex 3536):
-//   myTransform = 0x78   (Transform posisi Granny)
-//   player      = 0x130  (Transform posisi pemain)
-//   seePlayer   = 0x1D8  (bool: apakah Granny sedang melihat pemain)
+// ALUR:
+//   1. Saat libil2cpp.so dimuat -> GrannyESP_InstallHooks()
+//        - Hook AIGrannyController.FixedUpdate -> simpan instance Granny
+//          setiap physics frame ke g_grannyInstance.
+//        - Hook AIGrannyController.OnDisable -> bersihkan cache saat Granny
+//          nonaktif/destroy (cegah dangling pointer).
+//        - Resolve UnityEngine.Transform.get_position sebagai function
+//          pointer biasa -> panggil langsung, tanpa il2cpp API.
+//   2. Toggle ON -> tampilkan panel + thread pemantau (500 ms):
+//        baca myTransform(0x78) & player(0x130) dari instance,
+//        posisi via get_position(), jarak Euclidean, status seePlayer(0x1D8).
+//   3. Toggle OFF -> hentikan thread, sembunyikan panel.
+//
+// !!! PENTING: RVA & offset di bawah ini WAJIB dari dump.cs milik VERSI GAME
+// YANG SAMA PERSIS dengan yang terpasang di HP. Beda versi -> hook salah
+// alamat -> game crash. Kalau game update, dump ulang libil2cpp.so-nya
+// (il2cppdumper) lalu sesuaikan angka-angka ini.
 // ============================================================================
 
 #include <pthread.h>
@@ -28,228 +38,116 @@
 #include "../Includes/obfuscate.h"
 #include "../Includes/Logger.h"
 
-// ---------------------------------------------------------------------------
-// 1. Deklarasi il2cpp API.
-//    Semua fungsi ini diekspor oleh libil2cpp.so, jadi cukup di-dlsym.
-//    Struct dipakai opaque (void*) karena kita tidak butuh isi dalamnya.
-// ---------------------------------------------------------------------------
-struct Il2CppDomain;   struct Il2CppAssembly; struct Il2CppImage;
-struct Il2CppClass;    struct Il2CppObject;   struct Il2CppType;
-struct MethodInfo;
+#if defined(__aarch64__)
+#include "../And64InlineHook/And64InlineHook.hpp"
+#else
+#include "../Substrate/SubstrateHook.h"
+#include "../Substrate/CydiaSubstrate.h"
+#endif
 
-struct Il2CppApi {
-    Il2CppDomain*  (*domain_get)();
-    const Il2CppAssembly** (*domain_get_assemblies)(const Il2CppDomain*, size_t*);
-    const Il2CppImage*     (*assembly_get_image)(const Il2CppAssembly*);
-    const char*            (*image_get_name)(const Il2CppImage*);
-    Il2CppClass*           (*class_from_name)(const Il2CppImage*, const char*, const char*);
-    const MethodInfo*      (*class_get_method_from_name)(Il2CppClass*, const char*, int);
-    const Il2CppType*      (*class_get_type)(Il2CppClass*);
-    Il2CppObject*          (*type_get_object)(const Il2CppType*);
-    Il2CppObject*          (*runtime_invoke)(const MethodInfo*, void*, void**, Il2CppObject**);
-    void*                  (*object_unbox)(Il2CppObject*);
-    bool ok = false;
-};
+// --- RVA dari dump.cs (il2cppdumper) ---
+#define RVA_FIXEDUPDATE   0x1FE50D4u  // AIGrannyController.FixedUpdate
+#define RVA_ONDISABLE     0x1FE447Cu  // AIGrannyController.OnDisable
+#define RVA_GET_POSITION  0x3FF2004u  // UnityEngine.Transform.get_position
+
+// --- Field offset AIGrannyController (dump.cs) ---
+#define OFF_MY_TRANSFORM  0x78u
+#define OFF_PLAYER        0x130u
+#define OFF_SEE_PLAYER    0x1D8u
 
 struct Vector3 { float x, y, z; };
 
-// Offset field AIGrannyController (dump.cs). Ganti jika versi game berubah.
-static const uintptr_t OFF_MY_TRANSFORM = 0x78;
-static const uintptr_t OFF_PLAYER       = 0x130;
-static const uintptr_t OFF_SEE_PLAYER   = 0x1D8;
+// ---------------------------------------------------------------------------
+// State global
+// ---------------------------------------------------------------------------
+static JavaVM   *g_vm        = nullptr;
+static jobject   g_ctx       = nullptr;
+static jclass    g_menuClass = nullptr;
+static jmethodID g_midShow   = nullptr;
+static jmethodID g_midUpdate = nullptr;
+static jmethodID g_midHide   = nullptr;
 
-// ---------------------------------------------------------------------------
-// 2. State global modul
-// ---------------------------------------------------------------------------
-static JavaVM   *g_vm      = nullptr;
-static jobject   g_ctx     = nullptr;   // global ref ke Context (dari Init)
-static jclass    g_menuClass = nullptr; // global ref ke com/android/support/Menu
-static jmethodID g_midShow   = nullptr; // Menu.showGrannyPanel(Context)
-static jmethodID g_midUpdate = nullptr; // Menu.updateGrannyPanel(String)
-static jmethodID g_midHide   = nullptr; // Menu.hideGrannyPanel()
 static volatile bool g_enabled = false;
 static pthread_t g_thread;
 static bool      g_threadRunning = false;
-static Il2CppApi g_api;
+
+// Instance Granny yang sedang hidup (di-cache dari hook FixedUpdate)
+static void *g_grannyInstance = nullptr;
+// Function pointer UnityEngine.Transform.get_position (di-resolve sekali)
+static Vector3 (*orig_get_position)(void *transform) = nullptr;
+static bool g_hooksInstalled = false;
 
 // ---------------------------------------------------------------------------
-// 3. Resolve il2cpp API dari libil2cpp.so milik GAME.
-//
-// PENTING: kode ini HARUS berjalan di dalam proses game. Kalau mod dipasang
-// sebagai APK terpisah (proses sendiri), libil2cpp.so milik game tidak ada
-// di memori proses ini -> dlopen gagal. Itu sebabnya mod menu model LGL
-// harus di-merge ke dalam APK game (lihat CARA_PAKAI.md).
+// Base address libil2cpp.so dari /proc/self/maps (mapping pertama = base)
 // ---------------------------------------------------------------------------
-
-// Kumpulkan SEMUA path ".../libil2cpp.so" dari /proc/self/maps (untuk diagnostik)
-static std::vector<std::string> find_all_lib_paths_in_maps(const char *name) {
-    std::vector<std::string> out;
+static uintptr_t libil2cpp_base() {
+    static uintptr_t base = 0;
+    static bool done = false;
+    if (done) return base;
+    done = true;
     FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return out;
+    if (!f) return 0;
     char line[1024];
-    size_t namelen = strlen(name);
     while (fgets(line, sizeof(line), f)) {
-        const char *p = strchr(line, '/'); // path selalu diawali '/'
-        if (!p) continue;
-        std::string path(p);
-        while (!path.empty() &&
-               (path.back() == '\n' || path.back() == '\r' || path.back() == ' '))
-            path.pop_back();
-        // cocok hanya bila path BERAKHIR dengan nama lib yang dicari
-        if (path.size() >= namelen &&
-            path.compare(path.size() - namelen, namelen, name) == 0 &&
-            (out.empty() || out.back() != path))
-            out.push_back(path);
+        if (strstr(line, "libil2cpp.so")) {
+            unsigned long addr = 0;
+            if (sscanf(line, "%lx-", &addr) == 1) { base = (uintptr_t) addr; break; }
+        }
     }
     fclose(f);
-    return out;
-}
-
-// Cari path lengkap ".../libil2cpp.so" di /proc/self/maps, lalu dlopen
-// pakai path itu. Lebih andal daripada dlopen("libil2cpp.so") biasa.
-static std::string find_lib_path_in_maps(const char *name) {
-    auto v = find_all_lib_paths_in_maps(name);
-    return v.empty() ? "" : v[0];
-}
-
-static bool init_il2cpp_api(std::string &err) {
-    if (g_api.ok) return true;
-    void *handle = nullptr;
-    std::string used = "?";
-
-    // 1) path lengkap dari /proc/self/maps (paling andal)
-    auto candidates = find_all_lib_paths_in_maps("libil2cpp.so");
-    for (size_t i = 0; i < candidates.size(); i++)
-        LOGI("GrannyESP: maps[%zu] = %s", i, candidates[i].c_str());
-    if (!candidates.empty()) {
-        handle = dlopen(candidates[0].c_str(), RTLD_NOW);
-        if (handle) used = candidates[0];
-        LOGI("GrannyESP: dlopen maps -> %p", handle);
-    }
-    // 2) fallback: nama lib biasa
-    if (!handle) {
-        handle = dlopen("libil2cpp.so", RTLD_NOLOAD);
-        if (handle) used = "libil2cpp.so (sudah termuat)";
-    }
-    if (!handle) {
-        handle = dlopen("libil2cpp.so", RTLD_NOW);
-        if (handle) used = "libil2cpp.so";
-    }
-
-    if (!handle) {
-        const char *dle = dlerror();
-        err = "dlopen libil2cpp.so gagal";
-        if (dle && *dle) { err += ": "; err += dle; }
-        err += "\n(mod harus di-merge ke APK game)";
-        LOGE("GrannyESP: %s", err.c_str());
-        return false;
-    }
-
-    #define RESOLVE(name) \
-        dlerror(); /* bersihkan error lama */ \
-        g_api.name = (decltype(g_api.name)) dlsym(handle, #name); \
-        if (!g_api.name) { \
-            err = "dlsym gagal: "; err += #name; \
-            const char *dle2 = dlerror(); \
-            if (dle2 && *dle2) { err += "\n"; err += dle2; } \
-            err += "\nlib: "; err += used; \
-            LOGE("GrannyESP: %s", err.c_str()); \
-            return false; \
-        }
-
-    RESOLVE(domain_get);
-    RESOLVE(domain_get_assemblies);
-    RESOLVE(assembly_get_image);
-    RESOLVE(image_get_name);
-    RESOLVE(class_from_name);
-    RESOLVE(class_get_method_from_name);
-    RESOLVE(class_get_type);
-    RESOLVE(type_get_object);
-    RESOLVE(runtime_invoke);
-    RESOLVE(object_unbox);
-    #undef RESOLVE
-
-    g_api.ok = true;
-    LOGI("GrannyESP: il2cpp API OK");
-    return true;
+    LOGI("GrannyESP: libil2cpp base = %p", (void *) base);
+    return base;
 }
 
 // ---------------------------------------------------------------------------
-// 4. Cari instance AIGrannyController yang sedang hidup.
-//    Memakai UnityEngine.Object.FindObjectOfType(Type) lewat runtime_invoke,
-//    jadi tidak perlu hook dan tidak perlu tahu nama GameObject-nya.
+// Hook callbacks
 // ---------------------------------------------------------------------------
-static void *find_granny_instance() {
-    if (!g_api.ok) return nullptr;
+void (*old_FixedUpdate)(void *instance);
+void hook_FixedUpdate(void *instance) {
+    g_grannyInstance = instance; // Granny hidup & aktif -> simpan
+    if (old_FixedUpdate) old_FixedUpdate(instance);
+}
 
-    Il2CppDomain *domain = g_api.domain_get();
-    if (!domain) return nullptr;
+void (*old_OnDisable)(void *instance);
+void hook_OnDisable(void *instance) {
+    if (g_grannyInstance == instance) g_grannyInstance = nullptr; // cegah dangling
+    if (old_OnDisable) old_OnDisable(instance);
+}
 
-    size_t count = 0;
-    const Il2CppAssembly **asms = g_api.domain_get_assemblies(domain, &count);
-    const Il2CppImage *gameImg = nullptr, *coreImg = nullptr;
-    for (size_t i = 0; i < count && (!gameImg || !coreImg); i++) {
-        const Il2CppImage *img = g_api.assembly_get_image(asms[i]);
-        const char *n = g_api.image_get_name(img);
-        if (n && strcmp(n, "Assembly-CSharp.dll") == 0)        gameImg = img;
-        if (n && strcmp(n, "UnityEngine.CoreModule.dll") == 0)  coreImg = img;
+static void install_hook(void *addr, void *replace, void **orig) {
+#if defined(__aarch64__)
+    A64HookFunction(addr, replace, orig);
+#else
+    MSHookFunction(addr, replace, orig);
+#endif
+}
+
+// Dipanggil dari hack_thread (Main.cpp) setelah libil2cpp.so dimuat
+void GrannyESP_InstallHooks() {
+    if (g_hooksInstalled) return;
+    g_hooksInstalled = true;
+
+    uintptr_t base = libil2cpp_base();
+    if (!base) {
+        LOGE("GrannyESP: base libil2cpp.so tidak ketemu, hook batal");
+        return;
     }
-    if (!gameImg || !coreImg) return nullptr;
 
-    Il2CppClass *grannyKlass = g_api.class_from_name(gameImg, "", "AIGrannyController");
-    Il2CppClass *objectKlass = g_api.class_from_name(coreImg, "UnityEngine", "Object");
-    if (!grannyKlass || !objectKlass) return nullptr;
+    install_hook((void *) (base + RVA_FIXEDUPDATE),
+                 (void *) hook_FixedUpdate, (void **) &old_FixedUpdate);
+    install_hook((void *) (base + RVA_ONDISABLE),
+                 (void *) hook_OnDisable, (void **) &old_OnDisable);
+    orig_get_position =
+        (Vector3 (*)(void *)) (base + RVA_GET_POSITION);
 
-    const MethodInfo *find = g_api.class_get_method_from_name(objectKlass, "FindObjectOfType", 1);
-    if (!find) return nullptr;
-
-    // System.Type dari AIGrannyController sebagai argumen
-    Il2CppObject *typeObj = g_api.type_get_object(g_api.class_get_type(grannyKlass));
-    void *args[1] = { typeObj };
-    Il2CppObject *exc = nullptr;
-    Il2CppObject *res = g_api.runtime_invoke(find, nullptr, args, &exc);
-    if (exc || !res) return nullptr;
-    return res; // instance AIGrannyController (atau null bila Granny belum spawn)
+    LOGI("GrannyESP: hooks terpasang (FixedUpdate=%p OnDisable=%p get_position=%p)",
+         (void *) (base + RVA_FIXEDUPDATE),
+         (void *) (base + RVA_ONDISABLE),
+         (void *) (base + RVA_GET_POSITION));
 }
 
 // ---------------------------------------------------------------------------
-// 5. Baca posisi dunia sebuah Transform lewat Transform.get_position()
-// ---------------------------------------------------------------------------
-static const MethodInfo *g_getPos = nullptr;
-
-static Vector3 get_position(void *transform) {
-    Vector3 zero{0, 0, 0};
-    if (!transform || !g_api.ok) return zero;
-    if (!g_getPos) {
-        // cari sekali saja, lalu cache
-        size_t count = 0;
-        const Il2CppAssembly **asms =
-            g_api.domain_get_assemblies(g_api.domain_get(), &count);
-        for (size_t i = 0; i < count; i++) {
-            const Il2CppImage *img = g_api.assembly_get_image(asms[i]);
-            const char *n = g_api.image_get_name(img);
-            if (n && strcmp(n, "UnityEngine.CoreModule.dll") == 0) {
-                Il2CppClass *t = g_api.class_from_name(img, "UnityEngine", "Transform");
-                if (t) g_getPos = g_api.class_get_method_from_name(t, "get_position", 0);
-                break;
-            }
-        }
-        if (!g_getPos) return zero;
-    }
-    Il2CppObject *exc = nullptr;
-    Il2CppObject *boxed = g_api.runtime_invoke(g_getPos, transform, nullptr, &exc);
-    if (exc || !boxed) return zero;
-    void *raw = g_api.object_unbox(boxed); // Vector3 (12 byte: x,y,z float)
-    if (!raw) return zero;
-    return *(Vector3 *) raw;
-}
-
-static inline void *read_ptr(void *obj, uintptr_t off) {
-    return *(void **)((uintptr_t) obj + off);
-}
-
-// ---------------------------------------------------------------------------
-// 6. Jembatan JNI -> Menu.java (static methods, update via Handler di Java)
+// Jembatan JNI -> Menu.java (static methods, update via Handler di Java)
 // ---------------------------------------------------------------------------
 static void call_show_panel(JNIEnv *env) {
     if (g_menuClass && g_midShow && g_ctx)
@@ -269,20 +167,29 @@ static void call_hide_panel(JNIEnv *env) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Susun teks panel: nama, jarak, status terlihat/tidak
+// Susun teks panel
 // ---------------------------------------------------------------------------
+static inline void *read_ptr(void *obj, uintptr_t off) {
+    void *p = nullptr;
+    memcpy(&p, (void *) ((uintptr_t) obj + off), sizeof(p));
+    return p;
+}
+
 static std::string build_panel_text() {
-    void *granny = find_granny_instance();
+    void *granny = g_grannyInstance; // snapshot sekali
     if (!granny) return "Granny\nbelum spawn";
+    if (!orig_get_position) return "Granny\nhook belum siap";
+
     void *tGranny = read_ptr(granny, OFF_MY_TRANSFORM);
     void *tPlayer = read_ptr(granny, OFF_PLAYER);
     if (!tGranny || !tPlayer) return "Granny\nmenunggu data...";
 
-    Vector3 pg = get_position(tGranny);
-    Vector3 pp = get_position(tPlayer);
+    Vector3 pg = orig_get_position(tGranny);
+    Vector3 pp = orig_get_position(tPlayer);
     float dx = pg.x - pp.x, dy = pg.y - pp.y, dz = pg.z - pp.z;
     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-    bool seen = *(bool *)((uintptr_t) granny + OFF_SEE_PLAYER);
+    bool seen = false;
+    memcpy(&seen, (void *) ((uintptr_t) granny + OFF_SEE_PLAYER), sizeof(seen));
 
     char buf[128];
     snprintf(buf, sizeof(buf), "Granny\nJarak: %.1f m\n%s",
@@ -291,7 +198,7 @@ static std::string build_panel_text() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Thread pemantau: update panel tiap 500 ms selama fitur aktif
+// Thread pemantau: update panel tiap 500 ms selama fitur aktif
 // ---------------------------------------------------------------------------
 static void *monitor_thread(void *) {
     JNIEnv *env = nullptr;
@@ -299,14 +206,9 @@ static void *monitor_thread(void *) {
         g_threadRunning = false;
         return nullptr;
     }
-    std::string err;
-    if (!init_il2cpp_api(err)) {
-        call_update_panel(env, ("Granny\n" + err).c_str());
-    } else {
-        while (g_enabled) {
-            call_update_panel(env, build_panel_text().c_str());
-            for (int i = 0; i < 5 && g_enabled; i++) usleep(100000); // 500 ms
-        }
+    while (g_enabled) {
+        call_update_panel(env, build_panel_text().c_str());
+        for (int i = 0; i < 5 && g_enabled; i++) usleep(100000); // 500 ms
     }
     g_vm->DetachCurrentThread();
     g_threadRunning = false;
@@ -314,7 +216,7 @@ static void *monitor_thread(void *) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. API publik modul
+// API publik modul
 // ---------------------------------------------------------------------------
 void GrannyESP_OnLoad(JavaVM *vm) { g_vm = vm; }
 
@@ -322,8 +224,6 @@ void GrannyESP_SetContext(JNIEnv *env, jobject ctx) {
     if (g_ctx) env->DeleteGlobalRef(g_ctx);
     g_ctx = env->NewGlobalRef(ctx);
     // Cache class & method ID di thread Java (class loader benar).
-    // Thread native hasil AttachCurrentThread tidak bisa FindClass
-    // class aplikasi, jadi ini wajib di-cache di sini.
     jclass local = env->FindClass("com/android/support/Menu");
     if (local) {
         if (g_menuClass) env->DeleteGlobalRef(g_menuClass);

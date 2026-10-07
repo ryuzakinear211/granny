@@ -74,6 +74,10 @@ void *hack_thread(void *) {
 
     LOGI(OBFUSCATE("%s has been loaded"), (const char *) targetLibName);
 
+    // Pasang hook GrannyESP (FixedUpdate/OnDisable + get_position).
+    // Tanpa il2cpp API -> tahan terhadap libil2cpp.so yang di-strip.
+    GrannyESP_InstallHooks();
+
 #if defined(__aarch64__)
 
     //HOOK_LIB("libFileB.so", "0x000000", FunctionExample, old_FunctionExample);

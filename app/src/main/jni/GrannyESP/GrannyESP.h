@@ -3,22 +3,15 @@
 
 // ============================================================================
 // GrannyESP - Fitur "Show NPC Granny" + panel status jarak
+// PENDEKATAN HOOK (tanpa il2cpp API — tahan terhadap lib strip)
 // ----------------------------------------------------------------------------
-// Cara kerja (untuk dipelajari):
-//  1. Game Granny ini memakai il2cpp (libil2cpp.so). Semua class C# bisa
-//     diakses saat runtime lewat il2cpp API (il2cpp_class_from_name, dll).
-//  2. Kita cari SATU instance AIGrannyController yang sedang hidup memakai
-//     UnityEngine.Object.FindObjectOfType(Type).
-//  3. Dari instance itu kita baca field (offset diambil dari dump.cs):
-//         myTransform  -> 0x78  (Transform milik Granny)
-//         player       -> 0x130 (Transform milik pemain)
-//         seePlayer    -> 0x1D8 (bool, apakah Granny melihat pemain)
-//  4. Posisi dunia (Vector3) diambil lewat Transform.get_position().
-//  5. Jarak = |posGranny - posPlayer|, ditampilkan di panel overlay
-//     (TextView) yang dibuat di Menu.java, diupdate tiap 500 ms.
-// ----------------------------------------------------------------------------
-// Offset-offset di bawah ini BERGANTUNG PADA VERSI GAME. Kalau game diupdate,
-// buka dump.cs hasil il2cppdumper yang baru lalu sesuaikan angkanya.
+//  1. GrannyESP_InstallHooks() dipanggil sekali saat libil2cpp.so dimuat:
+//     hook AIGrannyController.FixedUpdate (cache instance) +
+//     AIGrannyController.OnDisable (bersihkan cache) via RVA dump.cs.
+//  2. GrannyESP_SetEnabled(true/false) dari toggle menu: tampil/sembunyi
+//     panel + mulai/hentikan thread pemantau (baca posisi tiap 500 ms).
+//
+// RVA & offset field (dump.cs) WAJIB dari versi game yang SAMA PERSIS.
 // ============================================================================
 
 #ifdef __cplusplus
@@ -30,6 +23,9 @@ void GrannyESP_OnLoad(JavaVM *vm);
 
 // Dipanggil dari Init() (Menu/Setup.h) untuk menyimpan Context aplikasi.
 void GrannyESP_SetContext(JNIEnv *env, jobject ctx);
+
+// Dipanggil dari hack_thread (Main.cpp) setelah libil2cpp.so dimuat.
+void GrannyESP_InstallHooks();
 
 // Dipanggil dari Changes() (Main.cpp) saat toggle "Show NPC Granny"
 // diubah. true = tampilkan panel & mulai pantau, false = sembunyikan.
