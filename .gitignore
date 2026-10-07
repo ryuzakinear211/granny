@@ -86,6 +86,5 @@ lint/tmp/
 
 # Android Profiling
 *.hprof
-# ndk-build outputs (reproducible via ndk-build)
-app/src/main/libs/
+# ndk-build intermediates (tetap di-exclude)
 app/src/main/obj/
