@@ -125,6 +125,8 @@ static void *g_enemyGrannyInstance = nullptr;
 // SEMUA instance AIGrannyController (bisa ada milik user + milik AI)
 static void *g_aiInstances[MAX_AI_INSTANCES];
 static int g_aiCount = 0;
+// Flag big head (di-set dari toggle, dibaca hook saat instance baru muncul)
+static bool g_bigHead = false;
 // Function pointer (semua dipanggil dengan method=NULL eksplisit)
 // UnityEngine.Transform.get_position()
 static Vector3 (*orig_get_position)(void *transform, void *method) = nullptr;
@@ -179,6 +181,9 @@ static uintptr_t libil2cpp_base() {
     return base;
 }
 
+// Forward declarations untuk dipakai hook
+static inline void *read_ptr(void *obj, uintptr_t off);
+
 // ---------------------------------------------------------------------------
 // Hook callbacks
 // ---------------------------------------------------------------------------
@@ -224,16 +229,56 @@ void hook_PlayerOnDisable(void *instance) {
 void (*old_EnemyFixedUpdate)(void *instance);
 void hook_EnemyFixedUpdate(void *instance) {
     g_enemyGrannyInstance = instance;
+    // Big head: langsung scale bila toggle aktif (tangani spawn setelah toggle)
+    if (g_bigHead && orig_get_parent && orig_set_localScale) {
+        void *eye = read_ptr(instance, OFF_ENEMY_EYE);
+        if (eye) {
+            void *head = orig_get_parent(eye, nullptr);
+            if (head) {
+                Vector3 s = { 2.5f, 2.5f, 2.5f };
+                orig_set_localScale(head, s, nullptr);
+            }
+        }
+    }
     if (old_EnemyFixedUpdate) old_EnemyFixedUpdate(instance);
 }
 
 // AIGrannyController.FixedUpdate: lacak SEMUA instance (user + AI)
 void (*old_AIFixedUpdate)(void *instance);
 void hook_AIFixedUpdate(void *instance) {
+    bool isNew = true;
     for (int i = 0; i < g_aiCount; i++)
-        if (g_aiInstances[i] == instance) { if (old_AIFixedUpdate) old_AIFixedUpdate(instance); return; }
-    if (g_aiCount < MAX_AI_INSTANCES)
+        if (g_aiInstances[i] == instance) { isNew = false; break; }
+    if (isNew && g_aiCount < MAX_AI_INSTANCES)
         g_aiInstances[g_aiCount++] = instance;
+    // Big head: scale bila toggle aktif dan instance BUKAN milik user
+    // (eye < 1m dari kamera = milik user, skip).
+    if (g_bigHead && isNew && orig_get_parent && orig_set_localScale &&
+        orig_get_position && orig_cam_get_main && orig_get_transform) {
+        void *eye = read_ptr(instance, OFF_AI_GRANNY_EYE);
+        if (eye) {
+            Vector3 eyeWp = orig_get_position(eye, nullptr);
+            void *cam = orig_cam_get_main(nullptr);
+            bool isUser = false;
+            if (cam) {
+                void *camT = orig_get_transform(cam, nullptr);
+                if (camT) {
+                    Vector3 camWp = orig_get_position(camT, nullptr);
+                    float dx = eyeWp.x - camWp.x;
+                    float dy = eyeWp.y - camWp.y;
+                    float dz = eyeWp.z - camWp.z;
+                    isUser = (dx*dx + dy*dy + dz*dz) < 1.0f;
+                }
+            }
+            if (!isUser) {
+                void *head = orig_get_parent(eye, nullptr);
+                if (head) {
+                    Vector3 s = { 2.5f, 2.5f, 2.5f };
+                    orig_set_localScale(head, s, nullptr);
+                }
+            }
+        }
+    }
     if (old_AIFixedUpdate) old_AIFixedUpdate(instance);
 }
 
@@ -742,32 +787,25 @@ void GrannyESP_SetDebug(bool enabled) {
 }
 
 // Kepala Besar Granny (client-side): scale up parent dari grannyEye
-// (tulang kepala) sebesar 2.5x. Dipanggil dari toggle (thread UI Java).
-// Mencari dari semua sumber AI yang terlacak.
-void GrannyESP_SetBigHead(bool enabled) {
-    if (!orig_get_parent || !orig_set_localScale) {
-        LOGE("GrannyESP: big head gagal (function pointer belum siap)");
-        return;
-    }
-    float s = enabled ? 2.5f : 1.0f;
+// (tulang kepala). Flag g_bigHead dibaca hook saat instance baru muncul,
+// sehingga Granny yang spawn setelah toggle tetap kena scale.
+static void scale_eye_parent(void *eye) {
+    if (!eye || !orig_get_parent || !orig_set_localScale) return;
+    void *head = orig_get_parent(eye, nullptr);
+    if (!head) return;
+    float s = g_bigHead ? 2.5f : 1.0f;
     Vector3 scale = { s, s, s };
-    int count = 0;
+    orig_set_localScale(head, scale, nullptr);
+}
 
-    // Helper: scale parent dari eye Transform
-    auto scale_head = [&](void *eye, unsigned eyeOff) {
-        // eyeOff tidak dipakai di sini; eye sudah Transform langsung
-        (void) eyeOff;
-        if (!eye) return;
-        void *head = orig_get_parent(eye, nullptr);
-        if (!head) return;
-        orig_set_localScale(head, scale, nullptr);
-        count++;
-    };
-
+// Terapkan big head ke semua sumber yang terlacak saat ini.
+// Dipanggil saat toggle diubah DAN periodik dari ESP thread (untuk
+// menangani Granny yang spawn setelah toggle ditekan).
+static void apply_big_head() {
     // 1. EnemyAIGranny.grannyEye (0x28)
     if (g_enemyGrannyInstance) {
         void *eye = read_ptr(g_enemyGrannyInstance, OFF_ENEMY_EYE);
-        scale_head(eye, 0);
+        scale_eye_parent(eye);
     }
     // 2. Semua instance AIGrannyController kecuali milik user
     {
@@ -778,10 +816,18 @@ void GrannyESP_SetBigHead(bool enabled) {
             void *ai = snap[i];
             if (!ai || eye_at_camera(ai, OFF_AI_GRANNY_EYE)) continue;
             void *eye = read_ptr(ai, OFF_AI_GRANNY_EYE);
-            scale_head(eye, 0);
+            scale_eye_parent(eye);
         }
     }
-    LOGI("GrannyESP: big head %s (%d kepala)", enabled ? "ON" : "OFF", count);
+    // 3. Manager NPC: cari head via eye dari AI yang menempel di GameObject-nya
+    //    (fallback: bila 1&2 tidak ketemu, coba dari posisi ESP)
+    //    -> untuk sekarang, andalkan 1&2; manager menyusul bila perlu
+}
+
+void GrannyESP_SetBigHead(bool enabled) {
+    g_bigHead = enabled;
+    apply_big_head();
+    LOGI("GrannyESP: big head %s", enabled ? "ON" : "OFF");
 }
 
 // Dipanggil dari Changes() di Main.cpp (thread UI Java)
