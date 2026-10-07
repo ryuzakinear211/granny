@@ -58,6 +58,8 @@
 #define RVA_GET_TRANSFORM 0x3FE0348u  // UnityEngine.Component.get_transform
 #define RVA_CAM_GET_MAIN  0x3FA83A0u  // UnityEngine.Camera.get_main()
 #define RVA_W2S           0x3FA8118u  // UnityEngine.Camera.WorldToScreenPoint(Vector3)
+#define RVA_VISUAL_START  0x200E354u  // GrannyChangeTexture.Start (objek VISUAL Granny)
+#define OFF_VISUAL_BODY   0x20u       // GrannyChangeTexture.grannyBody (Renderer)
 
 // --- Field offset AIGrannyController (dump.cs) ---
 #define OFF_MY_TRANSFORM  0x78u
@@ -89,6 +91,11 @@ static bool      g_threadRunning = false;
 
 // Instance Granny yang sedang hidup (di-cache dari hook FixedUpdate)
 static void *g_grannyInstance = nullptr;
+// Instance VISUAL Granny (di-cache dari hook GrannyChangeTexture.Start).
+// Screenshot debug membuktikan GameObject AIGrannyController BUKAN objek
+// visual Granny (tak satu pun titik T0/78/130/140/90 menempel di badannya),
+// jadi posisi ESP harus diambil dari objek visual ini.
+static void *g_visualGranny = nullptr;
 // Function pointer (semua dipanggil dengan method=NULL eksplisit)
 // UnityEngine.Transform.get_position()
 static Vector3 (*orig_get_position)(void *transform, void *method) = nullptr;
@@ -146,8 +153,21 @@ void hook_FixedUpdate(void *instance) {
 
 void (*old_OnDisable)(void *instance);
 void hook_OnDisable(void *instance) {
-    if (g_grannyInstance == instance) g_grannyInstance = nullptr; // cegah dangling
+    if (g_grannyInstance == instance) {
+        g_grannyInstance = nullptr; // cegah dangling
+        g_visualGranny = nullptr;   // visual kemungkinan ikut di-destroy
+    }
     if (old_OnDisable) old_OnDisable(instance);
+}
+
+// GrannyChangeTexture.Start: objek visual Granny baru spawn -> tangkap.
+// Start() hanya dipanggil sekali per objek; .so kita load sebelum scene game,
+// jadi hook terpasang sebelum Granny pertama spawn.
+void (*old_VisualStart)(void *instance);
+void hook_VisualStart(void *instance) {
+    g_visualGranny = instance;
+    LOGI("GrannyESP: visual Granny tertangkap: %p", instance);
+    if (old_VisualStart) old_VisualStart(instance);
 }
 
 static void install_hook(void *addr, void *replace, void **orig) {
@@ -173,6 +193,8 @@ void GrannyESP_InstallHooks() {
                  (void *) hook_FixedUpdate, (void **) &old_FixedUpdate);
     install_hook((void *) (base + RVA_ONDISABLE),
                  (void *) hook_OnDisable, (void **) &old_OnDisable);
+    install_hook((void *) (base + RVA_VISUAL_START),
+                 (void *) hook_VisualStart, (void **) &old_VisualStart);
     orig_get_position =
         (Vector3 (*)(void *, void *)) (base + RVA_GET_POSITION);
     orig_get_transform =
@@ -265,36 +287,82 @@ static bool verify_instance(void *granny, std::string &warnMsg) {
     return true;
 }
 
+// Kembalikan g_visualGranny bila class-nya masih GrannyChangeTexture.
+// Bila tidak cocok (RVA salah versi / pointer basi) -> buang & kembalikan null.
+static void *valid_visual() {
+    void *vis = g_visualGranny;
+    if (!vis) return nullptr;
+    const char *vc = get_class_name(vis);
+    if (vc && strcmp(vc, "GrannyChangeTexture") == 0) return vis;
+    g_visualGranny = nullptr;
+    return nullptr;
+}
+
+// Hasil resolusi posisi Granny
+struct GrannyPos {
+    Vector3 wp;
+    const char *src; // "VB" | "V" | "T0" | "78" | "?"
+    bool ok;
+};
+
+// Prioritas sumber posisi (yang pertama berhasil dipakai):
+//   VB = Renderer grannyBody milik objek VISUAL (paling akurat, mesh terlihat)
+//   V  = transform objek visual GrannyChangeTexture
+//   T0 = get_transform(instance AI)
+//   78 = field myTransform (fallback terakhir)
+static GrannyPos resolve_granny_pos() {
+    GrannyPos r = { {0, 0, 0}, "?", false };
+    if (!orig_get_transform || !orig_get_position) return r;
+
+    void *vis = valid_visual();
+    if (vis) {
+        void *body = read_ptr(vis, OFF_VISUAL_BODY); // Renderer grannyBody
+        void *t = body ? orig_get_transform(body, nullptr) : nullptr;
+        if (t) { r.wp = orig_get_position(t, nullptr); r.src = "VB"; r.ok = true; return r; }
+        t = orig_get_transform(vis, nullptr);
+        if (t) { r.wp = orig_get_position(t, nullptr); r.src = "V"; r.ok = true; return r; }
+    }
+
+    void *granny = g_grannyInstance;
+    if (granny) {
+        void *t = orig_get_transform(granny, nullptr);
+        if (t) { r.wp = orig_get_position(t, nullptr); r.src = "T0"; r.ok = true; return r; }
+        t = read_ptr(granny, OFF_MY_TRANSFORM);
+        if (t) { r.wp = orig_get_position(t, nullptr); r.src = "78"; r.ok = true; return r; }
+    }
+    return r;
+}
+
 // Panel debug: nama class + status null(0)/non-null(1) tiap offset kandidat
-// + koordinat dunia & layar (untuk memastikan ESP mengikuti Granny).
+// + sumber posisi aktif + koordinat dunia & layar.
 static std::string build_debug_text() {
     char buf[512];
     void *granny = g_grannyInstance;
-    if (!granny) { snprintf(buf, sizeof(buf), "DBG Granny\ninstance: null"); return buf; }
+    void *vis = valid_visual();
+    if (!granny && !vis) { snprintf(buf, sizeof(buf), "DBG Granny\ninstance: null"); return buf; }
     auto nz = [](void *p) -> const char * { return p ? "1" : "0"; };
-    int n = snprintf(buf, sizeof(buf), "DBG Granny\ncls=%s\n78:%s 130:%s\n140:%s 90:%s",
-             get_class_name(granny),
-             nz(read_ptr(granny, OFF_MY_TRANSFORM)),
-             nz(read_ptr(granny, OFF_PLAYER)),
-             nz(read_ptr(granny, 0x140u)),   // playerPos
-             nz(read_ptr(granny, 0x90u)));   // target
-    // Tambah world pos -> screen pos bila semua siap
+    int n = snprintf(buf, sizeof(buf), "DBG Granny\ncls=%s\nvis=%s\n78:%s 130:%s\n140:%s 90:%s",
+             granny ? get_class_name(granny) : "-",
+             vis ? get_class_name(vis) : "-",
+             granny ? nz(read_ptr(granny, OFF_MY_TRANSFORM)) : "-",
+             granny ? nz(read_ptr(granny, OFF_PLAYER)) : "-",
+             granny ? nz(read_ptr(granny, 0x140u)) : "-",   // playerPos
+             granny ? nz(read_ptr(granny, 0x90u)) : "-");   // target
+    // Tambah sumber posisi aktif + world pos -> screen pos
     if (n > 0 && (size_t) n < sizeof(buf) - 128 &&
-        g_clsOk && orig_get_transform && orig_get_position &&
         orig_cam_get_main && orig_world_to_screen) {
-        void *t = orig_get_transform(granny, nullptr);
-        if (t) {
-            Vector3 wp = orig_get_position(t, nullptr);
+        GrannyPos gp = resolve_granny_pos();
+        if (gp.ok) {
             void *cam = orig_cam_get_main(nullptr);
             if (cam) {
-                Vector3 sp = orig_world_to_screen(cam, wp, nullptr);
+                Vector3 sp = orig_world_to_screen(cam, gp.wp, nullptr);
                 snprintf(buf + n, sizeof(buf) - n,
-                         "\nw=%.0f,%.0f,%.0f\ns=%.0f,%.0f,%.0f",
-                         wp.x, wp.y, wp.z, sp.x, sp.y, sp.z);
+                         "\nsrc=%s\nw=%.0f,%.0f,%.0f\ns=%.0f,%.0f,%.0f",
+                         gp.src, gp.wp.x, gp.wp.y, gp.wp.z, sp.x, sp.y, sp.z);
             } else {
                 snprintf(buf + n, sizeof(buf) - n,
-                         "\nw=%.0f,%.0f,%.0f\ncam=null",
-                         wp.x, wp.y, wp.z);
+                         "\nsrc=%s\nw=%.0f,%.0f,%.0f\ncam=null",
+                         gp.src, gp.wp.x, gp.wp.y, gp.wp.z);
             }
         }
     }
@@ -305,19 +373,18 @@ static std::string build_panel_text() {
     void *granny = g_grannyInstance; // snapshot sekali
     std::string warn;
     if (!verify_instance(granny, warn)) return warn;
-    if (!orig_get_position || !orig_get_transform) return "Granny\nhook belum siap";
+    if (!orig_get_position) return "Granny\nhook belum siap";
 
-    // Transform Granny LANGSUNG dari component-nya (pasti milik Granny),
-    // tidak bergantung pada offset field myTransform.
-    void *tGranny = orig_get_transform(granny, nullptr);
+    // Posisi Granny dari resolver (prioritas: visual VB/V, lalu AI T0/78).
+    GrannyPos gp = resolve_granny_pos();
     // Posisi pemain: coba player(0x130) -> playerPos(0x140) -> target(0x90),
     // pakai yang pertama non-null (field target bisa null tergantung state AI).
     void *tPlayer = read_ptr(granny, OFF_PLAYER);
     if (!tPlayer) tPlayer = read_ptr(granny, 0x140u);
     if (!tPlayer) tPlayer = read_ptr(granny, 0x90u);
-    if (!tGranny || !tPlayer) return "Granny\nmenunggu data...";
+    if (!gp.ok || !tPlayer) return "Granny\nmenunggu data...";
 
-    Vector3 pg = orig_get_position(tGranny, nullptr);
+    Vector3 pg = gp.wp;
     Vector3 pp = orig_get_position(tPlayer, nullptr);
     float dx = pg.x - pp.x, dy = pg.y - pp.y, dz = pg.z - pp.z;
     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
@@ -325,8 +392,8 @@ static std::string build_panel_text() {
     memcpy(&seen, (void *) ((uintptr_t) granny + OFF_SEE_PLAYER), sizeof(seen));
 
     char buf[128];
-    snprintf(buf, sizeof(buf), "Granny\nJarak: %.1f m\n%s",
-             dist, seen ? "TERLIHAT!" : "aman");
+    snprintf(buf, sizeof(buf), "Granny (%s)\nJarak: %.1f m\n%s",
+             gp.src, dist, seen ? "TERLIHAT!" : "aman");
     return buf;
 }
 
@@ -426,16 +493,18 @@ static void *get_camera_cached() {
 }
 
 // Mode debug: proyeksikan SEMUA kandidat transform jadi titik berlabel:
-//   T0  = get_transform(instance)  (merah)
-//   78  = field myTransform         (kuning)
-//   130 = field player              (cyan)
-//   140 = field playerPos            (hijau)
-//   90  = field target              (putih)
+//   VB  = Renderer grannyBody visual   (magenta)
+//   V   = transform objek visual       (oranye)
+//   T0  = get_transform(instance AI)   (merah)
+//   78  = field myTransform            (kuning)
+//   130 = field player                 (cyan)
+//   140 = field playerPos              (hijau)
+//   90  = field target                 (putih)
 // Titik yang menempel di badan Granny = sumber posisi yang benar.
 static void draw_debug_candidates(JNIEnv *env) {
     void *granny = g_grannyInstance;
-    std::string warn;
-    if (!verify_instance(granny, warn) || !orig_get_transform || !orig_get_position ||
+    void *vis = valid_visual();
+    if ((!granny && !vis) || !orig_get_transform || !orig_get_position ||
         !orig_world_to_screen) {
         call_esp_multi(env, nullptr, 0); // kosongkan
         return;
@@ -443,17 +512,32 @@ static void draw_debug_candidates(JNIEnv *env) {
     void *cam = get_camera_cached();
     if (!cam) { call_esp_multi(env, nullptr, 0); return; }
 
+    // Kandidat dari objek visual
+    void *tVB = nullptr, *tV = nullptr;
+    if (vis) {
+        void *body = read_ptr(vis, OFF_VISUAL_BODY);
+        if (body) tVB = orig_get_transform(body, nullptr);
+        tV = orig_get_transform(vis, nullptr);
+    }
+
     struct Cand { const char *label; void *t; int color; };
-    Cand cands[5] = {
-        { "T0",  orig_get_transform(granny, nullptr), (int) 0xFFFF5252 },
-        { "78",  read_ptr(granny, OFF_MY_TRANSFORM),  (int) 0xFFFFFF00 },
-        { "130", read_ptr(granny, OFF_PLAYER),        (int) 0xFF00FFFF },
-        { "140", read_ptr(granny, 0x140u),            (int) 0xFF00FF00 },
-        { "90",  read_ptr(granny, 0x90u),             (int) 0xFFFFFFFF },
+    Cand cands[7] = {
+        { "VB",  tVB,                                 (int) 0xFFFF00FF },
+        { "V",   tV,                                  (int) 0xFFFF9800 },
+        { "T0",  granny ? orig_get_transform(granny, nullptr) : nullptr,
+                                                         (int) 0xFFFF5252 },
+        { "78",  granny ? read_ptr(granny, OFF_MY_TRANSFORM) : nullptr,
+                                                         (int) 0xFFFFFF00 },
+        { "130", granny ? read_ptr(granny, OFF_PLAYER) : nullptr,
+                                                         (int) 0xFF00FFFF },
+        { "140", granny ? read_ptr(granny, 0x140u) : nullptr,
+                                                         (int) 0xFF00FF00 },
+        { "90",  granny ? read_ptr(granny, 0x90u) : nullptr,
+                                                         (int) 0xFFFFFFFF },
     };
-    DbgPt pts[5];
+    DbgPt pts[7];
     int n = 0;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 7; i++) {
         if (!cands[i].t) continue;
         Vector3 wp = orig_get_position(cands[i].t, nullptr);
         Vector3 sp = orig_world_to_screen(cam, wp, nullptr);
@@ -465,24 +549,20 @@ static void draw_debug_candidates(JNIEnv *env) {
     call_esp_multi(env, pts, n);
 }
 
-// Satu frame ESP: posisi dunia Granny -> WorldToScreenPoint -> update overlay.
+// Satu frame ESP: posisi dunia Granny (via resolver) -> WorldToScreenPoint.
 // x<0 / name null = sembunyikan (di belakang kamera / belum ada data).
 static void update_esp_frame(JNIEnv *env) {
-    void *granny = g_grannyInstance;
-    std::string warn;
-    if (!verify_instance(granny, warn) || !orig_get_position || !orig_get_transform ||
-        !orig_cam_get_main || !orig_world_to_screen) {
+    if (!orig_cam_get_main || !orig_world_to_screen) {
         call_esp_update(env, -1, -1, nullptr);
         return;
     }
-    void *tGranny = orig_get_transform(granny, nullptr);
-    if (!tGranny) { call_esp_update(env, -1, -1, nullptr); return; }
+    GrannyPos gp = resolve_granny_pos();
+    if (!gp.ok) { call_esp_update(env, -1, -1, nullptr); return; }
 
     void *cam = get_camera_cached();
     if (!cam) { call_esp_update(env, -1, -1, nullptr); return; }
 
-    Vector3 wp = orig_get_position(tGranny, nullptr);          // posisi dunia
-    Vector3 sp = orig_world_to_screen(cam, wp, nullptr); // -> koordinat layar
+    Vector3 sp = orig_world_to_screen(cam, gp.wp, nullptr); // -> koordinat layar
     if (sp.z < 1.0f) { // z = depth; < 1 artinya di belakang kamera
         call_esp_update(env, -1, -1, nullptr);
         return;
