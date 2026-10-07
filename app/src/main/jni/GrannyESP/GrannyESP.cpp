@@ -66,6 +66,7 @@
 #define RVA_MGR_RETURN_GRANNY 0x1FF6F3Cu // manageGrannyAI.returnAIGranny() -> GameObject*
 // --- playerController: SEMUA pemain pakai class ini; role via isGranny ---
 #define RVA_PLAYER_START     0x201C034u // playerController.Start
+#define RVA_PLAYER_UPDATE    0x202E294u // playerController.Update (tiap frame!)
 #define RVA_PLAYER_ONDISABLE 0x201B550u // playerController.OnDisable
 #define OFF_PC_ISGRANNY      0x39Bu     // playerController.isGranny (bool)
 #define MAX_PLAYERS          16
@@ -159,18 +160,30 @@ static uintptr_t libil2cpp_base() {
 // ---------------------------------------------------------------------------
 // Hook callbacks
 // ---------------------------------------------------------------------------
-// playerController.Start: setiap pemain yang spawn lewat sini.
-// Kumpulkan SEMUA; role (isGranny) dibaca tiap frame karena bisa di-set
-// setelah Start.
-void (*old_PlayerStart)(void *instance);
-void hook_PlayerStart(void *instance) {
+// Daftarkan instance pemain bila belum ada (dipakai Start & Update)
+static void track_player(void *instance) {
     for (int i = 0; i < g_playerCount; i++)
-        if (g_players[i] == instance) { if (old_PlayerStart) old_PlayerStart(instance); return; }
+        if (g_players[i] == instance) return;
     if (g_playerCount < MAX_PLAYERS) {
         g_players[g_playerCount++] = instance;
         LOGI("GrannyESP: player tertangkap: %p (total %d)", instance, g_playerCount);
     }
+}
+
+// playerController.Start: setiap pemain yang spawn lewat sini.
+void (*old_PlayerStart)(void *instance);
+void hook_PlayerStart(void *instance) {
+    track_player(instance);
     if (old_PlayerStart) old_PlayerStart(instance);
+}
+
+// playerController.Update: jalan TIAP FRAME untuk semua pemain aktif.
+// Ini yang utama — menangkap pemain yang sudah spawn sebelum hook dipasang
+// (Start mereka sudah lewat).
+void (*old_PlayerUpdate)(void *instance);
+void hook_PlayerUpdate(void *instance) {
+    track_player(instance);
+    if (old_PlayerUpdate) old_PlayerUpdate(instance);
 }
 
 // playerController.OnDisable: keluarkan dari daftar (cegah dangling)
@@ -214,6 +227,8 @@ void GrannyESP_InstallHooks() {
 
     install_hook((void *) (base + RVA_PLAYER_START),
                  (void *) hook_PlayerStart, (void **) &old_PlayerStart);
+    install_hook((void *) (base + RVA_PLAYER_UPDATE),
+                 (void *) hook_PlayerUpdate, (void **) &old_PlayerUpdate);
     install_hook((void *) (base + RVA_PLAYER_ONDISABLE),
                  (void *) hook_PlayerOnDisable, (void **) &old_PlayerOnDisable);
     install_hook((void *) (base + RVA_MGR_AWAKE),
@@ -231,8 +246,9 @@ void GrannyESP_InstallHooks() {
     orig_world_to_screen =
         (Vector3 (*)(void *, Vector3, void *)) (base + RVA_W2S);
 
-    LOGI("GrannyESP: hooks terpasang (playerStart=%p playerOnDisable=%p mgrAwake=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
+    LOGI("GrannyESP: hooks terpasang (playerStart=%p playerUpdate=%p playerOnDisable=%p mgrAwake=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
          (void *) (base + RVA_PLAYER_START),
+         (void *) (base + RVA_PLAYER_UPDATE),
          (void *) (base + RVA_PLAYER_ONDISABLE),
          (void *) (base + RVA_MGR_AWAKE),
          (void *) (base + RVA_GET_POSITION),
