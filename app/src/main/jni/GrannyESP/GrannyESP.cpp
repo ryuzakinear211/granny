@@ -65,11 +65,21 @@
 #define RVA_MGR_AWAKE         0x1FF6F44u // manageGrannyAI.Awake
 #define RVA_MGR_RETURN_GRANNY 0x1FF6F3Cu // manageGrannyAI.returnAIGranny() -> GameObject*
 // --- playerController: SEMUA pemain pakai class ini; role via isGranny ---
+// (hanya relevan di multiplayer; di single player cuma ada user sendiri)
 #define RVA_PLAYER_START     0x201C034u // playerController.Start
 #define RVA_PLAYER_UPDATE    0x202E294u // playerController.Update (tiap frame!)
 #define RVA_PLAYER_ONDISABLE 0x201B550u // playerController.OnDisable
 #define OFF_PC_ISGRANNY      0x39Bu     // playerController.isGranny (bool)
 #define MAX_PLAYERS          16
+// --- EnemyAIGranny: AI Granny versi offline (tanpa Photon), untuk single player ---
+#define RVA_ENEMY_FIXEDUPDATE 0x1F4AB00u // EnemyAIGranny.FixedUpdate
+#define OFF_ENEMY_EYE         0x28u      // EnemyAIGranny.grannyEye (Transform)
+#define OFF_ENEMY_MYTRANSFORM 0x20u      // EnemyAIGranny.myTransform (Transform)
+// --- AIGrannyController: bisa juga dipakai AI (lacak SEMUA instance) ---
+#define RVA_AI_FIXEDUPDATE   0x1FE50D4u // AIGrannyController.FixedUpdate
+#define RVA_AI_ONDISABLE     0x1FE447Cu // AIGrannyController.OnDisable
+#define OFF_AI_GRANNY_EYE    0x80u      // AIGrannyController.grannyEye
+#define MAX_AI_INSTANCES     8
 
 // --- Field offset AIGrannyController (dump.cs) ---
 #define OFF_MY_TRANSFORM  0x78u
@@ -102,11 +112,17 @@ static bool      g_threadRunning = false;
 
 // Daftar SEMUA playerController (semua pemain pakai class ini).
 // Role dibaca tiap frame via isGranny (0x39B): true = Granny/seeker.
+// (Di single player hanya user sendiri yang ketangkap; tidak masalah.)
 static void *g_players[MAX_PLAYERS];
 static int g_playerCount = 0;
 // manageGrannyAI instance (punya referensi langsung ke GameObject NPC Granny,
 // untuk mode PvE / Story)
 static void *g_grannyManager = nullptr;
+// EnemyAIGranny instance (AI Granny offline untuk single player)
+static void *g_enemyGrannyInstance = nullptr;
+// SEMUA instance AIGrannyController (bisa ada milik user + milik AI)
+static void *g_aiInstances[MAX_AI_INSTANCES];
+static int g_aiCount = 0;
 // Function pointer (semua dipanggil dengan method=NULL eksplisit)
 // UnityEngine.Transform.get_position()
 static Vector3 (*orig_get_position)(void *transform, void *method) = nullptr;
@@ -198,6 +214,36 @@ void hook_PlayerOnDisable(void *instance) {
     if (old_PlayerOnDisable) old_PlayerOnDisable(instance);
 }
 
+// EnemyAIGranny.FixedUpdate: tangkap instance AI Granny offline
+void (*old_EnemyFixedUpdate)(void *instance);
+void hook_EnemyFixedUpdate(void *instance) {
+    g_enemyGrannyInstance = instance;
+    if (old_EnemyFixedUpdate) old_EnemyFixedUpdate(instance);
+}
+
+// AIGrannyController.FixedUpdate: lacak SEMUA instance (user + AI)
+void (*old_AIFixedUpdate)(void *instance);
+void hook_AIFixedUpdate(void *instance) {
+    for (int i = 0; i < g_aiCount; i++)
+        if (g_aiInstances[i] == instance) { if (old_AIFixedUpdate) old_AIFixedUpdate(instance); return; }
+    if (g_aiCount < MAX_AI_INSTANCES)
+        g_aiInstances[g_aiCount++] = instance;
+    if (old_AIFixedUpdate) old_AIFixedUpdate(instance);
+}
+
+// AIGrannyController.OnDisable: keluarkan dari daftar
+void (*old_AIOnDisable)(void *instance);
+void hook_AIOnDisable(void *instance) {
+    for (int i = 0; i < g_aiCount; i++) {
+        if (g_aiInstances[i] == instance) {
+            g_aiInstances[i] = g_aiInstances[--g_aiCount];
+            break;
+        }
+    }
+    if (g_enemyGrannyInstance == instance) g_enemyGrannyInstance = nullptr;
+    if (old_AIOnDisable) old_AIOnDisable(instance);
+}
+
 // manageGrannyAI.Awake: tangkap manager NPC Granny
 void (*old_MgrAwake)(void *instance);
 void hook_MgrAwake(void *instance) {
@@ -231,6 +277,12 @@ void GrannyESP_InstallHooks() {
                  (void *) hook_PlayerUpdate, (void **) &old_PlayerUpdate);
     install_hook((void *) (base + RVA_PLAYER_ONDISABLE),
                  (void *) hook_PlayerOnDisable, (void **) &old_PlayerOnDisable);
+    install_hook((void *) (base + RVA_ENEMY_FIXEDUPDATE),
+                 (void *) hook_EnemyFixedUpdate, (void **) &old_EnemyFixedUpdate);
+    install_hook((void *) (base + RVA_AI_FIXEDUPDATE),
+                 (void *) hook_AIFixedUpdate, (void **) &old_AIFixedUpdate);
+    install_hook((void *) (base + RVA_AI_ONDISABLE),
+                 (void *) hook_AIOnDisable, (void **) &old_AIOnDisable);
     install_hook((void *) (base + RVA_MGR_AWAKE),
                  (void *) hook_MgrAwake, (void **) &old_MgrAwake);
     orig_returnAIGranny =
@@ -246,10 +298,13 @@ void GrannyESP_InstallHooks() {
     orig_world_to_screen =
         (Vector3 (*)(void *, Vector3, void *)) (base + RVA_W2S);
 
-    LOGI("GrannyESP: hooks terpasang (playerStart=%p playerUpdate=%p playerOnDisable=%p mgrAwake=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
+    LOGI("GrannyESP: hooks terpasang (playerStart=%p playerUpdate=%p playerOnDisable=%p enemyFU=%p aiFU=%p aiOnDis=%p mgrAwake=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
          (void *) (base + RVA_PLAYER_START),
          (void *) (base + RVA_PLAYER_UPDATE),
          (void *) (base + RVA_PLAYER_ONDISABLE),
+         (void *) (base + RVA_ENEMY_FIXEDUPDATE),
+         (void *) (base + RVA_AI_FIXEDUPDATE),
+         (void *) (base + RVA_AI_ONDISABLE),
          (void *) (base + RVA_MGR_AWAKE),
          (void *) (base + RVA_GET_POSITION),
          (void *) (base + RVA_GET_TRANSFORM),
@@ -350,56 +405,97 @@ static bool sane_pos(Vector3 wp) {
 
 #define MAX_GRANNIES 8
 
-// Kumpulkan SEMUA Granny yang terlihat oleh ESP:
-//   1. NPC via manageGrannyAI.returnAIGranny() (mode PvE / Story)
-//   2. Pemain dengan playerController.isGranny==true (mode PvP; 2 seeker)
-// isGranny dibaca TIAP PANGGIL (bukan sekali saat Start) karena bisa di-set
-// setelah Start. Diri sendiri di-skip (jarak < 1m dari kamera).
+// True bila grannyEye instance ini menempel di kamera (< 1m) = milik user
+// sendiri, bukan AI Granny. Dipakai untuk filter instance AIGrannyController.
+static bool eye_at_camera(void *aiInstance, unsigned eyeOff) {
+    if (!aiInstance || !orig_get_position) return false;
+    void *tEye = read_ptr(aiInstance, eyeOff);
+    if (!tEye) return false;
+    Vector3 eyeWp = orig_get_position(tEye, nullptr);
+    Vector3 camWp;
+    if (!get_camera_pos(&camWp)) return false;
+    float dx = eyeWp.x - camWp.x, dy = eyeWp.y - camWp.y, dz = eyeWp.z - camWp.z;
+    return (dx*dx + dy*dy + dz*dz) < 1.0f;
+}
+
+// Kumpulkan SEMUA Granny yang terlihat oleh ESP (mode single & multi):
+//   1. EnemyAIGranny.grannyEye (0x28) — AI offline, utama untuk single player
+//   2. AIGrannyController.grannyEye (0x80) dari SEMUA instance kecuali milik
+//      user sendiri (eye menempel di kamera)
+//   3. NPC via manageGrannyAI.returnAIGranny() (fallback)
+//   4. Pemain dengan playerController.isGranny==true (mode PvP)
+// Diri sendiri selalu di-skip (jarak < 1m dari kamera).
 // Return: jumlah posisi yang terkumpul (0..maxOut).
 static int collect_grannies(Vector3 *outPos, int maxOut) {
     int n = 0;
     if (!orig_get_position || maxOut <= 0) return 0;
+    Vector3 camWp;
+    bool haveCam = get_camera_pos(&camWp);
+    auto skip_self = [&](Vector3 wp) {
+        if (!haveCam) return false;
+        float dx = wp.x - camWp.x, dy = wp.y - camWp.y, dz = wp.z - camWp.z;
+        return (dx*dx + dy*dy + dz*dz) < 1.0f;
+    };
 
-    // 1. NPC langsung dari manager
+    // 1. EnemyAIGranny (AI offline single player) — grannyEye 0x28
+    if (g_enemyGrannyInstance) {
+        void *t = read_ptr(g_enemyGrannyInstance, OFF_ENEMY_EYE);
+        if (!t) t = read_ptr(g_enemyGrannyInstance, OFF_ENEMY_MYTRANSFORM);
+        if (t) {
+            Vector3 wp = orig_get_position(t, nullptr);
+            if (sane_pos(wp) && !skip_self(wp) && n < maxOut) outPos[n++] = wp;
+        }
+    }
+
+    // 2. Semua instance AIGrannyController kecuali milik user
+    {
+        void *snap[MAX_AI_INSTANCES];
+        int sc = g_aiCount < MAX_AI_INSTANCES ? g_aiCount : MAX_AI_INSTANCES;
+        for (int i = 0; i < sc; i++) snap[i] = g_aiInstances[i];
+        for (int i = 0; i < sc && n < maxOut; i++) {
+            void *ai = snap[i];
+            if (!ai || eye_at_camera(ai, OFF_AI_GRANNY_EYE)) continue; // milik user
+            void *t = read_ptr(ai, OFF_AI_GRANNY_EYE);
+            if (t) {
+                Vector3 wp = orig_get_position(t, nullptr);
+                if (sane_pos(wp) && !skip_self(wp) && n < maxOut) outPos[n++] = wp;
+            }
+        }
+    }
+
+    // 3. NPC langsung dari manager (fallback)
     if (g_grannyManager && orig_returnAIGranny && orig_go_get_transform) {
         void *go = orig_returnAIGranny(g_grannyManager, nullptr);
         if (go) {
             void *t = orig_go_get_transform(go, nullptr);
             if (t) {
                 Vector3 wp = orig_get_position(t, nullptr);
-                if (sane_pos(wp) && n < maxOut) outPos[n++] = wp;
+                if (sane_pos(wp) && !skip_self(wp) && n < maxOut) outPos[n++] = wp;
             }
         }
     }
 
-    // 2. Pemain Granny (playerController.isGranny)
-    if (!orig_get_transform) return n;
-    // Snapshot cepat daftar pemain untuk hindari race dengan hook thread
-    void *snap[MAX_PLAYERS];
-    int sc = g_playerCount < MAX_PLAYERS ? g_playerCount : MAX_PLAYERS;
-    for (int i = 0; i < sc; i++) snap[i] = g_players[i];
-    Vector3 camWp;
-    bool haveCam = get_camera_pos(&camWp);
-    for (int i = 0; i < sc && n < maxOut; i++) {
-        void *pc = snap[i];
-        if (!pc) continue;
-        bool isGranny = false;
-        memcpy(&isGranny, (char *) pc + OFF_PC_ISGRANNY, 1);
-        if (!isGranny) continue;
-        void *t = orig_get_transform(pc, nullptr); // playerController = Component
-        if (!t) continue;
-        Vector3 wp = orig_get_position(t, nullptr);
-        if (!sane_pos(wp)) continue;
-        if (haveCam) { // skip diri sendiri
-            float dx = wp.x - camWp.x, dy = wp.y - camWp.y, dz = wp.z - camWp.z;
-            if (dx*dx + dy*dy + dz*dz < 1.0f) continue;
+    // 4. Pemain Granny (playerController.isGranny) — mode PvP
+    if (orig_get_transform) {
+        void *snap[MAX_PLAYERS];
+        int sc = g_playerCount < MAX_PLAYERS ? g_playerCount : MAX_PLAYERS;
+        for (int i = 0; i < sc; i++) snap[i] = g_players[i];
+        for (int i = 0; i < sc && n < maxOut; i++) {
+            void *pc = snap[i];
+            if (!pc) continue;
+            bool isGranny = false;
+            memcpy(&isGranny, (char *) pc + OFF_PC_ISGRANNY, 1);
+            if (!isGranny) continue;
+            void *t = orig_get_transform(pc, nullptr);
+            if (!t) continue;
+            Vector3 wp = orig_get_position(t, nullptr);
+            if (sane_pos(wp) && !skip_self(wp) && n < maxOut) outPos[n++] = wp;
         }
-        outPos[n++] = wp;
     }
     return n;
 }
 
-// Panel debug: status manager/NPC/pemain + jumlah Granny + koordinat pertama.
+// Panel debug: status semua sumber + jumlah Granny + koordinat pertama.
 static std::string build_debug_text() {
     char buf[512];
     const char *npcState = "-";
@@ -408,9 +504,11 @@ static std::string build_debug_text() {
     }
     Vector3 wps[MAX_GRANNIES];
     int ng = collect_grannies(wps, MAX_GRANNIES);
-    int n = snprintf(buf, sizeof(buf), "DBG Granny\nmgr:%s npc:%s\nplayers:%d granny:%d",
+    int n = snprintf(buf, sizeof(buf), "DBG Granny\nmgr:%s npc:%s\nai:%d enemy:%s pl:%d g:%d",
              g_grannyManager ? "1" : "0",
              npcState,
+             g_aiCount,
+             g_enemyGrannyInstance ? "1" : "0",
              g_playerCount, ng);
     if (n > 0 && (size_t) n < sizeof(buf) - 128 &&
         orig_cam_get_main && orig_world_to_screen && ng > 0) {
