@@ -63,6 +63,8 @@
 #define RVA_GO_GET_TRANSFORM 0x3FE3E70u // UnityEngine.GameObject.get_transform
 #define RVA_TR_GET_PARENT    0x3FF1F2Cu // UnityEngine.Transform.get_parent()
 #define RVA_TR_SET_LOCALSCALE 0x3FF28A4u // UnityEngine.Transform.set_localScale(Vector3)
+#define RVA_TR_GET_CHILDCOUNT 0x3FF4150u // UnityEngine.Transform.get_childCount()
+#define RVA_TR_GET_CHILD     0x3FF41F8u // UnityEngine.Transform.GetChild(int)
 // --- manageGrannyAI: manager NPC Granny (mode PvE) ---
 #define RVA_MGR_AWAKE         0x1FF6F44u // manageGrannyAI.Awake
 #define RVA_MGR_RETURN_GRANNY 0x1FF6F3Cu // manageGrannyAI.returnAIGranny() -> GameObject*
@@ -82,6 +84,9 @@
 #define RVA_AI_ONDISABLE     0x1FE447Cu // AIGrannyController.OnDisable
 #define OFF_AI_GRANNY_EYE    0x80u      // AIGrannyController.grannyEye
 #define MAX_AI_INSTANCES     8
+// --- GrannyChangeTexture: komponen VISUAL nempel di badan Granny ---
+// Start() valid di 0x200E354. Untuk big head: dapat GameObject yang terlihat.
+#define RVA_VIS_START        0x200E354u // GrannyChangeTexture.Start
 
 // --- Field offset AIGrannyController (dump.cs) ---
 #define OFF_MY_TRANSFORM  0x78u
@@ -125,6 +130,10 @@ static void *g_enemyGrannyInstance = nullptr;
 // SEMUA instance AIGrannyController (bisa ada milik user + milik AI)
 static void *g_aiInstances[MAX_AI_INSTANCES];
 static int g_aiCount = 0;
+// Instance visual Granny (GrannyChangeTexture.Start) — untuk big head
+static void *g_visInstance = nullptr;
+// Transform kepala yang di-scale (untuk restore)
+static void *g_headTransform = nullptr;
 // Flag big head (di-set dari toggle, dibaca hook saat instance baru muncul)
 static bool g_bigHead = false;
 // Function pointer (semua dipanggil dengan method=NULL eksplisit)
@@ -147,6 +156,10 @@ static void *(*orig_go_get_transform)(void *go, void *method) = nullptr;
 static void *(*orig_get_parent)(void *transform, void *method) = nullptr;
 // UnityEngine.Transform.set_localScale(Vector3)
 static void (*orig_set_localScale)(void *transform, Vector3 scale, void *method) = nullptr;
+// UnityEngine.Transform.get_childCount()
+static int (*orig_get_childCount)(void *transform) = nullptr;
+// UnityEngine.Transform.GetChild(int)
+static void *(*orig_get_child)(void *transform, int index, void *method) = nullptr;
 static bool g_hooksInstalled = false;
 
 // Cache main camera (di-refresh tiap 2 detik, kamera bisa ganti saat pindah scene)
@@ -183,6 +196,44 @@ static uintptr_t libil2cpp_base() {
 
 // Forward declarations untuk dipakai hook
 static inline void *read_ptr(void *obj, uintptr_t off);
+static void apply_big_head_to_visual();
+
+// Cari Transform dengan Y dunia tertinggi (kemungkinan kepala) rekursif.
+// depth dibatasi 8, children dibatasi 64 (sanity).
+static void find_highest_y(void *t, float *bestY, void **bestT, int depth) {
+    if (!t || !orig_get_position || depth > 8) return;
+    Vector3 wp = orig_get_position(t, nullptr);
+    if (wp.x != wp.x) return; // NaN guard
+    if (!*bestT || wp.y > *bestY) {
+        *bestY = wp.y;
+        *bestT = t;
+    }
+    if (!orig_get_childCount || !orig_get_child) return;
+    int cc = orig_get_childCount(t);
+    if (cc < 0 || cc > 64) return;
+    for (int i = 0; i < cc; i++) {
+        void *child = orig_get_child(t, i, nullptr);
+        if (child) find_highest_y(child, bestY, bestT, depth + 1);
+    }
+}
+
+// Terapkan big head ke visual Granny: cari tulang tertinggi (kepala),
+// scale 2.5x bila ON, 1x bila OFF. Jangan scale root (seluruh badan)!
+static void apply_big_head_to_visual() {
+    if (!g_visInstance || !orig_get_transform || !orig_set_localScale) return;
+    void *root = orig_get_transform(g_visInstance, nullptr);
+    if (!root) return;
+    float bestY = -1e9f;
+    void *bestT = nullptr;
+    find_highest_y(root, &bestY, &bestT, 0);
+    if (bestT && bestT != root) {
+        g_headTransform = bestT;
+        float s = g_bigHead ? 2.5f : 1.0f;
+        Vector3 scale = { s, s, s };
+        orig_set_localScale(bestT, scale, nullptr);
+        LOGI("GrannyESP: big head visual %s (y=%.1f)", g_bigHead ? "ON" : "OFF", bestY);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Hook callbacks
@@ -303,6 +354,16 @@ void hook_MgrAwake(void *instance) {
     if (old_MgrAwake) old_MgrAwake(instance);
 }
 
+// GrannyChangeTexture.Start: komponen visual PASTI nempel di badan Granny
+// yang terlihat. Untuk big head.
+void (*old_VisStart)(void *instance);
+void hook_VisStart(void *instance) {
+    g_visInstance = instance;
+    LOGI("GrannyESP: visual Granny tertangkap: %p", instance);
+    if (g_bigHead) apply_big_head_to_visual();
+    if (old_VisStart) old_VisStart(instance);
+}
+
 static void install_hook(void *addr, void *replace, void **orig) {
 #if defined(__aarch64__)
     A64HookFunction(addr, replace, orig);
@@ -336,6 +397,8 @@ void GrannyESP_InstallHooks() {
                  (void *) hook_AIOnDisable, (void **) &old_AIOnDisable);
     install_hook((void *) (base + RVA_MGR_AWAKE),
                  (void *) hook_MgrAwake, (void **) &old_MgrAwake);
+    install_hook((void *) (base + RVA_VIS_START),
+                 (void *) hook_VisStart, (void **) &old_VisStart);
     orig_returnAIGranny =
         (void *(*)(void *, void *)) (base + RVA_MGR_RETURN_GRANNY);
     orig_go_get_transform =
@@ -344,6 +407,10 @@ void GrannyESP_InstallHooks() {
         (void *(*)(void *, void *)) (base + RVA_TR_GET_PARENT);
     orig_set_localScale =
         (void (*)(void *, Vector3, void *)) (base + RVA_TR_SET_LOCALSCALE);
+    orig_get_childCount =
+        (int (*)(void *)) (base + RVA_TR_GET_CHILDCOUNT);
+    orig_get_child =
+        (void *(*)(void *, int, void *)) (base + RVA_TR_GET_CHILD);
     orig_get_position =
         (Vector3 (*)(void *, void *)) (base + RVA_GET_POSITION);
     orig_get_transform =
@@ -826,7 +893,8 @@ static void apply_big_head() {
 
 void GrannyESP_SetBigHead(bool enabled) {
     g_bigHead = enabled;
-    apply_big_head();
+    apply_big_head(); // AI instances (eye -> parent)
+    apply_big_head_to_visual(); // visual: cari tulang tertinggi
     LOGI("GrannyESP: big head %s", enabled ? "ON" : "OFF");
 }
 
