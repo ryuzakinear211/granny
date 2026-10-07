@@ -111,7 +111,8 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
     const char *features[] = {
             OBFUSCATE("Category_Granny ESP"),
             OBFUSCATE("Toggle_Show NPC Granny"),//case 0
-            OBFUSCATE("Toggle_Debug Info Granny"),//case 1
+            OBFUSCATE("Toggle_Enable ESP"),//case 1
+            OBFUSCATE("Toggle_Debug Info Granny"),//case 2
            
     };
 
@@ -141,7 +142,10 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
         case 0: // Toggle_Show NPC Granny
             GrannyESP_SetEnabled(boolean);
             break;
-        case 1: // Toggle_Debug Info Granny
+        case 1: // Toggle_Enable ESP
+            GrannyESP_SetESP(boolean);
+            break;
+        case 2: // Toggle_Debug Info Granny
             GrannyESP_SetDebug(boolean);
             break;
     }

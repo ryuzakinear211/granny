@@ -35,6 +35,9 @@ void GrannyESP_SetEnabled(bool enabled);
 // + status null/non-null field kandidat (untuk diagnosis offset).
 void GrannyESP_SetDebug(bool enabled);
 
+// Toggle "Enable ESP": overlay gambar (line + nametag) di dalam game.
+void GrannyESP_SetESP(bool enabled);
+
 #ifdef __cplusplus
 }
 #endif

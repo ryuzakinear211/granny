@@ -1126,6 +1126,7 @@ public class Menu {
             mWindowManager.removeView(rootFrame);
         }
         hideGrannyPanel();
+        EspView.destroyEsp();
         if (grannyPanel != null && grannyPanelWM != null) {
             try { grannyPanelWM.removeView(grannyPanel); } catch (Exception ignored) {}
             grannyPanel = null;

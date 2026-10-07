@@ -32,6 +32,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <time.h>
 #include <string>
 #include <vector>
 #include "GrannyESP.h"
@@ -49,6 +50,8 @@
 #define RVA_FIXEDUPDATE   0x1FE50D4u  // AIGrannyController.FixedUpdate
 #define RVA_ONDISABLE     0x1FE447Cu  // AIGrannyController.OnDisable
 #define RVA_GET_POSITION  0x3FF2004u  // UnityEngine.Transform.get_position
+#define RVA_CAM_GET_MAIN  0x3FA83A0u  // UnityEngine.Camera.get_main()
+#define RVA_W2S           0x3FA8118u  // UnityEngine.Camera.WorldToScreenPoint(Vector3)
 
 // --- Field offset AIGrannyController (dump.cs) ---
 #define OFF_MY_TRANSFORM  0x78u
@@ -66,6 +69,11 @@ static jclass    g_menuClass = nullptr;
 static jmethodID g_midShow   = nullptr;
 static jmethodID g_midUpdate = nullptr;
 static jmethodID g_midHide   = nullptr;
+// JNI ke EspView.java (overlay gambar)
+static jclass    g_espClass   = nullptr;
+static jmethodID g_espShow    = nullptr; // showEsp(Context)
+static jmethodID g_espHide    = nullptr; // hideEsp()
+static jmethodID g_espUpdate  = nullptr; // updateEsp(float,float,String)
 
 static volatile bool g_enabled = false;
 static volatile bool g_debug = false; // mode debug: tampilkan info mentah
@@ -76,7 +84,21 @@ static bool      g_threadRunning = false;
 static void *g_grannyInstance = nullptr;
 // Function pointer UnityEngine.Transform.get_position (di-resolve sekali)
 static Vector3 (*orig_get_position)(void *transform) = nullptr;
+// UnityEngine.Camera.get_main() -> Camera* main camera
+static void *(*orig_cam_get_main)() = nullptr;
+// UnityEngine.Camera.WorldToScreenPoint(Vector3) -> Vector3 layar (x, y, z=depth)
+static Vector3 (*orig_world_to_screen)(void *camera, Vector3 pos) = nullptr;
 static bool g_hooksInstalled = false;
+
+// Cache main camera (di-refresh tiap 2 detik, kamera bisa ganti saat pindah scene)
+static void *g_cachedCam = nullptr;
+static uint64_t g_camTimeMs = 0;
+
+static uint64_t now_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000u + (uint64_t) ts.tv_nsec / 1000000u;
+}
 
 // ---------------------------------------------------------------------------
 // Base address libil2cpp.so dari /proc/self/maps (mapping pertama = base)
@@ -140,11 +162,17 @@ void GrannyESP_InstallHooks() {
                  (void *) hook_OnDisable, (void **) &old_OnDisable);
     orig_get_position =
         (Vector3 (*)(void *)) (base + RVA_GET_POSITION);
+    orig_cam_get_main =
+        (void *(*)()) (base + RVA_CAM_GET_MAIN);
+    orig_world_to_screen =
+        (Vector3 (*)(void *, Vector3)) (base + RVA_W2S);
 
-    LOGI("GrannyESP: hooks terpasang (FixedUpdate=%p OnDisable=%p get_position=%p)",
+    LOGI("GrannyESP: hooks terpasang (FixedUpdate=%p OnDisable=%p get_position=%p get_main=%p w2s=%p)",
          (void *) (base + RVA_FIXEDUPDATE),
          (void *) (base + RVA_ONDISABLE),
-         (void *) (base + RVA_GET_POSITION));
+         (void *) (base + RVA_GET_POSITION),
+         (void *) (base + RVA_CAM_GET_MAIN),
+         (void *) (base + RVA_W2S));
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +285,72 @@ static void *monitor_thread(void *) {
 }
 
 // ---------------------------------------------------------------------------
+// ESP overlay: thread penggambar (line + nametag)
+// ---------------------------------------------------------------------------
+static volatile bool g_esp = false;
+static pthread_t g_espThread;
+static bool      g_espRunning = false;
+
+static void call_esp_show(JNIEnv *env) {
+    if (g_espClass && g_espShow && g_ctx)
+        env->CallStaticVoidMethod(g_espClass, g_espShow, g_ctx);
+}
+
+static void call_esp_hide(JNIEnv *env) {
+    if (g_espClass && g_espHide)
+        env->CallStaticVoidMethod(g_espClass, g_espHide);
+}
+
+static void call_esp_update(JNIEnv *env, float x, float y, const char *name) {
+    if (!g_espClass || !g_espUpdate) return;
+    jstring s = name ? env->NewStringUTF(name) : nullptr;
+    env->CallStaticVoidMethod(g_espClass, g_espUpdate, (jfloat) x, (jfloat) y, s);
+    if (s) env->DeleteLocalRef(s);
+}
+
+// Satu frame ESP: posisi dunia Granny -> WorldToScreenPoint -> update overlay.
+// x<0 / name null = sembunyikan (di belakang kamera / belum ada data).
+static void update_esp_frame(JNIEnv *env) {
+    void *granny = g_grannyInstance;
+    if (!granny || !orig_get_position || !orig_cam_get_main || !orig_world_to_screen) {
+        call_esp_update(env, -1, -1, nullptr);
+        return;
+    }
+    void *tGranny = read_ptr(granny, OFF_MY_TRANSFORM);
+    if (!tGranny) { call_esp_update(env, -1, -1, nullptr); return; }
+
+    uint64_t now = now_ms();
+    if (!g_cachedCam || now - g_camTimeMs > 2000) { // refresh kamera tiap 2 dtk
+        g_cachedCam = orig_cam_get_main();
+        g_camTimeMs = now;
+    }
+    if (!g_cachedCam) { call_esp_update(env, -1, -1, nullptr); return; }
+
+    Vector3 wp = orig_get_position(tGranny);          // posisi dunia
+    Vector3 sp = orig_world_to_screen(g_cachedCam, wp); // -> koordinat layar
+    if (sp.z < 1.0f) { // z = depth; < 1 artinya di belakang kamera
+        call_esp_update(env, -1, -1, nullptr);
+        return;
+    }
+    call_esp_update(env, sp.x, sp.y, "Granny");
+}
+
+static void *esp_thread(void *) {
+    JNIEnv *env = nullptr;
+    if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+        g_espRunning = false;
+        return nullptr;
+    }
+    while (g_esp) {
+        update_esp_frame(env);
+        usleep(100000); // ~10 fps, cukup mulus & hemat CPU
+    }
+    g_vm->DetachCurrentThread();
+    g_espRunning = false;
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // API publik modul
 // ---------------------------------------------------------------------------
 void GrannyESP_OnLoad(JavaVM *vm) { g_vm = vm; }
@@ -275,6 +369,38 @@ void GrannyESP_SetContext(JNIEnv *env, jobject ctx) {
                                              "(Ljava/lang/String;)V");
         g_midHide   = env->GetStaticMethodID(g_menuClass, "hideGrannyPanel", "()V");
         env->DeleteLocalRef(local);
+    }
+    // Cache EspView (overlay gambar) + method-methodnya
+    jclass espLocal = env->FindClass("com/android/support/EspView");
+    if (espLocal) {
+        if (g_espClass) env->DeleteGlobalRef(g_espClass);
+        g_espClass = (jclass) env->NewGlobalRef(espLocal);
+        g_espShow   = env->GetStaticMethodID(g_espClass, "showEsp",
+                                             "(Landroid/content/Context;)V");
+        g_espHide   = env->GetStaticMethodID(g_espClass, "hideEsp", "()V");
+        g_espUpdate = env->GetStaticMethodID(g_espClass, "updateEsp",
+                                             "(FFLjava/lang/String;)V");
+        env->DeleteLocalRef(espLocal);
+    }
+}
+
+// Dipanggil dari Changes() di Main.cpp (thread UI Java)
+void GrannyESP_SetESP(bool enabled) {
+    if (!g_vm || enabled == g_esp) return;
+    g_esp = enabled;
+
+    JNIEnv *env = nullptr;
+    if (g_vm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK) return;
+
+    if (enabled) {
+        call_esp_show(env);
+        g_espRunning = true;
+        pthread_create(&g_espThread, nullptr, esp_thread, nullptr);
+        LOGI("GrannyESP: ESP ON");
+    } else {
+        if (g_espRunning) pthread_join(g_espThread, nullptr);
+        call_esp_hide(env);
+        LOGI("GrannyESP: ESP OFF");
     }
 }
 
