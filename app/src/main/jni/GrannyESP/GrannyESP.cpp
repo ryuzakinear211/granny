@@ -428,7 +428,11 @@ static void update_esp_frame(JNIEnv *env) {
     if (!cam) { call_esp_update(env, -1, -1, nullptr); return; }
 
     Vector3 sp = orig_world_to_screen(cam, gp.wp, nullptr); // -> koordinat layar
-    if (sp.z < 1.0f) { // z = depth; < 1 artinya di belakang kamera
+    // z = jarak dari kamera (meter). Sembunyikan HANYA bila di belakang
+    // kamera (z <= 0; x/y hasil proyeksi jadi terbalik/mirror).
+    // JANGAN pakai threshold > 0 (mis. 1.0): Granny yang dekat pemain
+    // (< 1 m, wajar saat mengejar) ikut tersembunyi -> ESP kedip muncul-hilang.
+    if (sp.z <= 0.0f) {
         call_esp_update(env, -1, -1, nullptr);
         return;
     }
