@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <string>
+#include <vector>
 #include "GrannyESP.h"
 #include "../Includes/obfuscate.h"
 #include "../Includes/Logger.h"
@@ -80,13 +81,12 @@ static Il2CppApi g_api;
 // harus di-merge ke dalam APK game (lihat CARA_PAKAI.md).
 // ---------------------------------------------------------------------------
 
-// Cari path lengkap ".../libil2cpp.so" di /proc/self/maps, lalu dlopen
-// pakai path itu. Lebih andal daripada dlopen("libil2cpp.so") biasa.
-static std::string find_lib_path_in_maps(const char *name) {
+// Kumpulkan SEMUA path ".../libil2cpp.so" dari /proc/self/maps (untuk diagnostik)
+static std::vector<std::string> find_all_lib_paths_in_maps(const char *name) {
+    std::vector<std::string> out;
     FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return "";
+    if (!f) return out;
     char line[1024];
-    std::string res;
     size_t namelen = strlen(name);
     while (fgets(line, sizeof(line), f)) {
         const char *p = strchr(line, '/'); // path selalu diawali '/'
@@ -97,28 +97,44 @@ static std::string find_lib_path_in_maps(const char *name) {
             path.pop_back();
         // cocok hanya bila path BERAKHIR dengan nama lib yang dicari
         if (path.size() >= namelen &&
-            path.compare(path.size() - namelen, namelen, name) == 0) {
-            res = path;
-            break;
-        }
+            path.compare(path.size() - namelen, namelen, name) == 0 &&
+            (out.empty() || out.back() != path))
+            out.push_back(path);
     }
     fclose(f);
-    return res;
+    return out;
+}
+
+// Cari path lengkap ".../libil2cpp.so" di /proc/self/maps, lalu dlopen
+// pakai path itu. Lebih andal daripada dlopen("libil2cpp.so") biasa.
+static std::string find_lib_path_in_maps(const char *name) {
+    auto v = find_all_lib_paths_in_maps(name);
+    return v.empty() ? "" : v[0];
 }
 
 static bool init_il2cpp_api(std::string &err) {
     if (g_api.ok) return true;
     void *handle = nullptr;
+    std::string used = "?";
 
     // 1) path lengkap dari /proc/self/maps (paling andal)
-    std::string full = find_lib_path_in_maps("libil2cpp.so");
-    if (!full.empty()) {
-        handle = dlopen(full.c_str(), RTLD_NOW);
-        LOGI("GrannyESP: dlopen maps [%s] -> %p", full.c_str(), handle);
+    auto candidates = find_all_lib_paths_in_maps("libil2cpp.so");
+    for (size_t i = 0; i < candidates.size(); i++)
+        LOGI("GrannyESP: maps[%zu] = %s", i, candidates[i].c_str());
+    if (!candidates.empty()) {
+        handle = dlopen(candidates[0].c_str(), RTLD_NOW);
+        if (handle) used = candidates[0];
+        LOGI("GrannyESP: dlopen maps -> %p", handle);
     }
     // 2) fallback: nama lib biasa
-    if (!handle) handle = dlopen("libil2cpp.so", RTLD_NOLOAD);
-    if (!handle) handle = dlopen("libil2cpp.so", RTLD_NOW);
+    if (!handle) {
+        handle = dlopen("libil2cpp.so", RTLD_NOLOAD);
+        if (handle) used = "libil2cpp.so (sudah termuat)";
+    }
+    if (!handle) {
+        handle = dlopen("libil2cpp.so", RTLD_NOW);
+        if (handle) used = "libil2cpp.so";
+    }
 
     if (!handle) {
         const char *dle = dlerror();
@@ -130,9 +146,13 @@ static bool init_il2cpp_api(std::string &err) {
     }
 
     #define RESOLVE(name) \
+        dlerror(); /* bersihkan error lama */ \
         g_api.name = (decltype(g_api.name)) dlsym(handle, #name); \
         if (!g_api.name) { \
             err = "dlsym gagal: "; err += #name; \
+            const char *dle2 = dlerror(); \
+            if (dle2 && *dle2) { err += "\n"; err += dle2; } \
+            err += "\nlib: "; err += used; \
             LOGE("GrannyESP: %s", err.c_str()); \
             return false; \
         }
