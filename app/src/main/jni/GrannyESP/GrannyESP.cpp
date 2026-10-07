@@ -47,9 +47,15 @@
 #endif
 
 // --- RVA dari dump.cs (il2cppdumper) ---
+// [FreeFunction] = icall, tapi RVA di sini adalah stub/wrapper di libil2cpp.so
+// yang tetap bisa dipanggil via function pointer.
+// CATATAN ABI il2cpp: setiap method managed punya parameter tersembunyi
+// terakhir `const MethodInfo* method`. Kita pass NULL (tolerated untuk
+// method-method sederhana ini) — JANGAN biarkan register terisi sampah.
 #define RVA_FIXEDUPDATE   0x1FE50D4u  // AIGrannyController.FixedUpdate
 #define RVA_ONDISABLE     0x1FE447Cu  // AIGrannyController.OnDisable
 #define RVA_GET_POSITION  0x3FF2004u  // UnityEngine.Transform.get_position
+#define RVA_GET_TRANSFORM 0x3FE0348u  // UnityEngine.Component.get_transform
 #define RVA_CAM_GET_MAIN  0x3FA83A0u  // UnityEngine.Camera.get_main()
 #define RVA_W2S           0x3FA8118u  // UnityEngine.Camera.WorldToScreenPoint(Vector3)
 
@@ -82,12 +88,18 @@ static bool      g_threadRunning = false;
 
 // Instance Granny yang sedang hidup (di-cache dari hook FixedUpdate)
 static void *g_grannyInstance = nullptr;
-// Function pointer UnityEngine.Transform.get_position (di-resolve sekali)
-static Vector3 (*orig_get_position)(void *transform) = nullptr;
+// Function pointer (semua dipanggil dengan method=NULL eksplisit)
+// UnityEngine.Transform.get_position()
+static Vector3 (*orig_get_position)(void *transform, void *method) = nullptr;
+// UnityEngine.Component.get_transform() -> Transform milik GameObject-nya.
+// AIGrannyController adalah MonoBehaviour yang NEMPEL di GameObject Granny,
+// jadi get_transform(instance) = transform Granny, dijamin benar tanpa
+// bergantung pada offset field myTransform.
+static void *(*orig_get_transform)(void *component, void *method) = nullptr;
 // UnityEngine.Camera.get_main() -> Camera* main camera
-static void *(*orig_cam_get_main)() = nullptr;
+static void *(*orig_cam_get_main)(void *method) = nullptr;
 // UnityEngine.Camera.WorldToScreenPoint(Vector3) -> Vector3 layar (x, y, z=depth)
-static Vector3 (*orig_world_to_screen)(void *camera, Vector3 pos) = nullptr;
+static Vector3 (*orig_world_to_screen)(void *camera, Vector3 pos, void *method) = nullptr;
 static bool g_hooksInstalled = false;
 
 // Cache main camera (di-refresh tiap 2 detik, kamera bisa ganti saat pindah scene)
@@ -161,16 +173,19 @@ void GrannyESP_InstallHooks() {
     install_hook((void *) (base + RVA_ONDISABLE),
                  (void *) hook_OnDisable, (void **) &old_OnDisable);
     orig_get_position =
-        (Vector3 (*)(void *)) (base + RVA_GET_POSITION);
+        (Vector3 (*)(void *, void *)) (base + RVA_GET_POSITION);
+    orig_get_transform =
+        (void *(*)(void *, void *)) (base + RVA_GET_TRANSFORM);
     orig_cam_get_main =
-        (void *(*)()) (base + RVA_CAM_GET_MAIN);
+        (void *(*)(void *)) (base + RVA_CAM_GET_MAIN);
     orig_world_to_screen =
-        (Vector3 (*)(void *, Vector3)) (base + RVA_W2S);
+        (Vector3 (*)(void *, Vector3, void *)) (base + RVA_W2S);
 
-    LOGI("GrannyESP: hooks terpasang (FixedUpdate=%p OnDisable=%p get_position=%p get_main=%p w2s=%p)",
+    LOGI("GrannyESP: hooks terpasang (FixedUpdate=%p OnDisable=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
          (void *) (base + RVA_FIXEDUPDATE),
          (void *) (base + RVA_ONDISABLE),
          (void *) (base + RVA_GET_POSITION),
+         (void *) (base + RVA_GET_TRANSFORM),
          (void *) (base + RVA_CAM_GET_MAIN),
          (void *) (base + RVA_W2S));
 }
@@ -223,27 +238,77 @@ static const char *get_class_name(void *obj) {
     return "?";
 }
 
+// Verifikasi instance yang di-hook benar AIGrannyController.
+// Dipanggil tiap frame; pengecekan nama class hanya saat instance berganti.
+static char g_clsName[64] = "";
+static bool g_clsOk = false;
+static void *g_clsCheckedFor = nullptr;
+
+static bool verify_instance(void *granny, std::string &warnMsg) {
+    if (!granny) { warnMsg = "Granny\nbelum spawn"; return false; }
+    if (granny != g_clsCheckedFor) {
+        g_clsCheckedFor = granny;
+        const char *nm = get_class_name(granny);
+        strncpy(g_clsName, nm ? nm : "?", sizeof(g_clsName) - 1);
+        g_clsName[sizeof(g_clsName) - 1] = '\0';
+        g_clsOk = (strcmp(g_clsName, "AIGrannyController") == 0);
+        LOGI("GrannyESP: instance class = %s (%s)",
+             g_clsName, g_clsOk ? "OK" : "SALAH SASARAN");
+    }
+    if (!g_clsOk) {
+        warnMsg = "Granny\nHook salah sasaran!\ncls=";
+        warnMsg += g_clsName;
+        warnMsg += "\n(RVA tidak cocok versi)";
+        return false;
+    }
+    return true;
+}
+
 // Panel debug: nama class + status null(0)/non-null(1) tiap offset kandidat
+// + koordinat dunia & layar (untuk memastikan ESP mengikuti Granny).
 static std::string build_debug_text() {
-    char buf[256];
+    char buf[512];
     void *granny = g_grannyInstance;
     if (!granny) { snprintf(buf, sizeof(buf), "DBG Granny\ninstance: null"); return buf; }
     auto nz = [](void *p) -> const char * { return p ? "1" : "0"; };
-    snprintf(buf, sizeof(buf), "DBG Granny\ncls=%s\n78:%s 130:%s\n140:%s 90:%s",
+    int n = snprintf(buf, sizeof(buf), "DBG Granny\ncls=%s\n78:%s 130:%s\n140:%s 90:%s",
              get_class_name(granny),
              nz(read_ptr(granny, OFF_MY_TRANSFORM)),
              nz(read_ptr(granny, OFF_PLAYER)),
              nz(read_ptr(granny, 0x140u)),   // playerPos
              nz(read_ptr(granny, 0x90u)));   // target
+    // Tambah world pos -> screen pos bila semua siap
+    if (n > 0 && (size_t) n < sizeof(buf) - 128 &&
+        g_clsOk && orig_get_transform && orig_get_position &&
+        orig_cam_get_main && orig_world_to_screen) {
+        void *t = orig_get_transform(granny, nullptr);
+        if (t) {
+            Vector3 wp = orig_get_position(t, nullptr);
+            void *cam = orig_cam_get_main(nullptr);
+            if (cam) {
+                Vector3 sp = orig_world_to_screen(cam, wp, nullptr);
+                snprintf(buf + n, sizeof(buf) - n,
+                         "\nw=%.0f,%.0f,%.0f\ns=%.0f,%.0f,%.0f",
+                         wp.x, wp.y, wp.z, sp.x, sp.y, sp.z);
+            } else {
+                snprintf(buf + n, sizeof(buf) - n,
+                         "\nw=%.0f,%.0f,%.0f\ncam=null",
+                         wp.x, wp.y, wp.z);
+            }
+        }
+    }
     return buf;
 }
 
 static std::string build_panel_text() {
     void *granny = g_grannyInstance; // snapshot sekali
-    if (!granny) return "Granny\nbelum spawn";
-    if (!orig_get_position) return "Granny\nhook belum siap";
+    std::string warn;
+    if (!verify_instance(granny, warn)) return warn;
+    if (!orig_get_position || !orig_get_transform) return "Granny\nhook belum siap";
 
-    void *tGranny = read_ptr(granny, OFF_MY_TRANSFORM);
+    // Transform Granny LANGSUNG dari component-nya (pasti milik Granny),
+    // tidak bergantung pada offset field myTransform.
+    void *tGranny = orig_get_transform(granny, nullptr);
     // Posisi pemain: coba player(0x130) -> playerPos(0x140) -> target(0x90),
     // pakai yang pertama non-null (field target bisa null tergantung state AI).
     void *tPlayer = read_ptr(granny, OFF_PLAYER);
@@ -251,8 +316,8 @@ static std::string build_panel_text() {
     if (!tPlayer) tPlayer = read_ptr(granny, 0x90u);
     if (!tGranny || !tPlayer) return "Granny\nmenunggu data...";
 
-    Vector3 pg = orig_get_position(tGranny);
-    Vector3 pp = orig_get_position(tPlayer);
+    Vector3 pg = orig_get_position(tGranny, nullptr);
+    Vector3 pp = orig_get_position(tPlayer, nullptr);
     float dx = pg.x - pp.x, dy = pg.y - pp.y, dz = pg.z - pp.z;
     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
     bool seen = false;
@@ -312,22 +377,24 @@ static void call_esp_update(JNIEnv *env, float x, float y, const char *name) {
 // x<0 / name null = sembunyikan (di belakang kamera / belum ada data).
 static void update_esp_frame(JNIEnv *env) {
     void *granny = g_grannyInstance;
-    if (!granny || !orig_get_position || !orig_cam_get_main || !orig_world_to_screen) {
+    std::string warn;
+    if (!verify_instance(granny, warn) || !orig_get_position || !orig_get_transform ||
+        !orig_cam_get_main || !orig_world_to_screen) {
         call_esp_update(env, -1, -1, nullptr);
         return;
     }
-    void *tGranny = read_ptr(granny, OFF_MY_TRANSFORM);
+    void *tGranny = orig_get_transform(granny, nullptr);
     if (!tGranny) { call_esp_update(env, -1, -1, nullptr); return; }
 
     uint64_t now = now_ms();
     if (!g_cachedCam || now - g_camTimeMs > 2000) { // refresh kamera tiap 2 dtk
-        g_cachedCam = orig_cam_get_main();
+        g_cachedCam = orig_cam_get_main(nullptr);
         g_camTimeMs = now;
     }
     if (!g_cachedCam) { call_esp_update(env, -1, -1, nullptr); return; }
 
-    Vector3 wp = orig_get_position(tGranny);          // posisi dunia
-    Vector3 sp = orig_world_to_screen(g_cachedCam, wp); // -> koordinat layar
+    Vector3 wp = orig_get_position(tGranny, nullptr);          // posisi dunia
+    Vector3 sp = orig_world_to_screen(g_cachedCam, wp, nullptr); // -> koordinat layar
     if (sp.z < 1.0f) { // z = depth; < 1 artinya di belakang kamera
         call_esp_update(env, -1, -1, nullptr);
         return;
