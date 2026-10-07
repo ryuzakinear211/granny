@@ -80,6 +80,11 @@
 #define RVA_AI_ONDISABLE     0x1FE447Cu // AIGrannyController.OnDisable
 #define OFF_AI_GRANNY_EYE    0x80u      // AIGrannyController.grannyEye
 #define MAX_AI_INSTANCES     8
+// --- GrannyChangeTexture: komponen VISUAL yang nempel di GameObject Granny ---
+// Hook Update (tiap frame) -> instance selalu fresh, transform-nya = posisi
+// badan Granny yang TERLIHAT. Jalur paling langsung!
+#define RVA_VIS_UPDATE       0x200E484u // GrannyChangeTexture.Update
+#define MAX_VIS_INSTANCES    4
 
 // --- Field offset AIGrannyController (dump.cs) ---
 #define OFF_MY_TRANSFORM  0x78u
@@ -123,6 +128,9 @@ static void *g_enemyGrannyInstance = nullptr;
 // SEMUA instance AIGrannyController (bisa ada milik user + milik AI)
 static void *g_aiInstances[MAX_AI_INSTANCES];
 static int g_aiCount = 0;
+// Instance GrannyChangeTexture (komponen visual Granny) — di-update tiap frame
+static void *g_visInstances[MAX_VIS_INSTANCES];
+static int g_visCount = 0;
 // Function pointer (semua dipanggil dengan method=NULL eksplisit)
 // UnityEngine.Transform.get_position()
 static Vector3 (*orig_get_position)(void *transform, void *method) = nullptr;
@@ -244,6 +252,19 @@ void hook_AIOnDisable(void *instance) {
     if (old_AIOnDisable) old_AIOnDisable(instance);
 }
 
+// GrannyChangeTexture.Update: komponen visual Granny, jalan tiap frame.
+// Instance-nya = GameObject Granny yang TERLIHAT. Simpan semua yang aktif.
+void (*old_VisUpdate)(void *instance);
+void hook_VisUpdate(void *instance) {
+    for (int i = 0; i < g_visCount; i++)
+        if (g_visInstances[i] == instance) { if (old_VisUpdate) old_VisUpdate(instance); return; }
+    if (g_visCount < MAX_VIS_INSTANCES) {
+        g_visInstances[g_visCount++] = instance;
+        LOGI("GrannyESP: visual Granny tertangkap: %p (total %d)", instance, g_visCount);
+    }
+    if (old_VisUpdate) old_VisUpdate(instance);
+}
+
 // manageGrannyAI.Awake: tangkap manager NPC Granny
 void (*old_MgrAwake)(void *instance);
 void hook_MgrAwake(void *instance) {
@@ -283,6 +304,8 @@ void GrannyESP_InstallHooks() {
                  (void *) hook_AIFixedUpdate, (void **) &old_AIFixedUpdate);
     install_hook((void *) (base + RVA_AI_ONDISABLE),
                  (void *) hook_AIOnDisable, (void **) &old_AIOnDisable);
+    install_hook((void *) (base + RVA_VIS_UPDATE),
+                 (void *) hook_VisUpdate, (void **) &old_VisUpdate);
     install_hook((void *) (base + RVA_MGR_AWAKE),
                  (void *) hook_MgrAwake, (void **) &old_MgrAwake);
     orig_returnAIGranny =
@@ -298,13 +321,14 @@ void GrannyESP_InstallHooks() {
     orig_world_to_screen =
         (Vector3 (*)(void *, Vector3, void *)) (base + RVA_W2S);
 
-    LOGI("GrannyESP: hooks terpasang (playerStart=%p playerUpdate=%p playerOnDisable=%p enemyFU=%p aiFU=%p aiOnDis=%p mgrAwake=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
+    LOGI("GrannyESP: hooks terpasang (playerStart=%p playerUpdate=%p playerOnDisable=%p enemyFU=%p aiFU=%p aiOnDis=%p visUpd=%p mgrAwake=%p get_position=%p get_transform=%p get_main=%p w2s=%p)",
          (void *) (base + RVA_PLAYER_START),
          (void *) (base + RVA_PLAYER_UPDATE),
          (void *) (base + RVA_PLAYER_ONDISABLE),
          (void *) (base + RVA_ENEMY_FIXEDUPDATE),
          (void *) (base + RVA_AI_FIXEDUPDATE),
          (void *) (base + RVA_AI_ONDISABLE),
+         (void *) (base + RVA_VIS_UPDATE),
          (void *) (base + RVA_MGR_AWAKE),
          (void *) (base + RVA_GET_POSITION),
          (void *) (base + RVA_GET_TRANSFORM),
@@ -418,8 +442,11 @@ static bool eye_at_camera(void *aiInstance, unsigned eyeOff) {
     return (dx*dx + dy*dy + dz*dz) < 1.0f;
 }
 
-// Kumpulkan SEMUA Granny yang terlihat oleh ESP (mode single & multi):
-//   1. EnemyAIGranny.grannyEye (0x28) — AI offline, utama untuk single player
+// Kumpulkan SEMUA Granny yang terlihat oleh ESP (mode single & multi).
+// Prioritas:
+//   0. GrannyChangeTexture (komponen VISUAL) — transform-nya = badan Granny
+//      yang TERLIHAT. Paling akurat!
+//   1. EnemyAIGranny.grannyEye (0x28) — AI offline, untuk single player
 //   2. AIGrannyController.grannyEye (0x80) dari SEMUA instance kecuali milik
 //      user sendiri (eye menempel di kamera)
 //   3. NPC via manageGrannyAI.returnAIGranny() (fallback)
@@ -436,6 +463,23 @@ static int collect_grannies(Vector3 *outPos, int maxOut) {
         float dx = wp.x - camWp.x, dy = wp.y - camWp.y, dz = wp.z - camWp.z;
         return (dx*dx + dy*dy + dz*dz) < 1.0f;
     };
+
+    // 0. VISUAL Granny (GrannyChangeTexture) — paling akurat!
+    //    Instance adalah Component -> get_transform langsung = transform Granny.
+    if (orig_get_transform) {
+        void *snap[MAX_VIS_INSTANCES];
+        int sc = g_visCount < MAX_VIS_INSTANCES ? g_visCount : MAX_VIS_INSTANCES;
+        for (int i = 0; i < sc; i++) snap[i] = g_visInstances[i];
+        for (int i = 0; i < sc && n < maxOut; i++) {
+            void *vis = snap[i];
+            if (!vis) continue;
+            void *t = orig_get_transform(vis, nullptr);
+            if (!t) continue;
+            Vector3 wp = orig_get_position(t, nullptr);
+            if (sane_pos(wp) && !skip_self(wp) && n < maxOut) outPos[n++] = wp;
+        }
+        if (n > 0) return n; // visual ketemu -> langsung pakai, skip yang lain
+    }
 
     // 1. EnemyAIGranny (AI offline single player) — grannyEye 0x28
     if (g_enemyGrannyInstance) {
@@ -504,11 +548,12 @@ static std::string build_debug_text() {
     }
     Vector3 wps[MAX_GRANNIES];
     int ng = collect_grannies(wps, MAX_GRANNIES);
-    int n = snprintf(buf, sizeof(buf), "DBG Granny\nmgr:%s npc:%s\nai:%d enemy:%s pl:%d g:%d",
+    int n = snprintf(buf, sizeof(buf), "DBG Granny\nmgr:%s npc:%s\nai:%d en:%s vis:%d pl:%d g:%d",
              g_grannyManager ? "1" : "0",
              npcState,
              g_aiCount,
              g_enemyGrannyInstance ? "1" : "0",
+             g_visCount,
              g_playerCount, ng);
     if (n > 0 && (size_t) n < sizeof(buf) - 128 &&
         orig_cam_get_main && orig_world_to_screen && ng > 0) {
