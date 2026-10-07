@@ -61,6 +61,14 @@
 #define RVA_GET_TRANSFORM 0x3FE0348u  // UnityEngine.Component.get_transform
 #define RVA_CAM_GET_MAIN  0x3FA83A0u  // UnityEngine.Camera.get_main()
 #define RVA_W2S           0x3FA8118u  // UnityEngine.Camera.WorldToScreenPoint(Vector3)
+#define RVA_GO_GET_TRANSFORM 0x3FE3E70u // UnityEngine.GameObject.get_transform
+// --- manageGrannyAI: manager NPC Granny (punya referensi langsung!) ---
+#define RVA_MGR_AWAKE         0x1FF6F44u // manageGrannyAI.Awake
+#define RVA_MGR_RETURN_GRANNY 0x1FF6F3Cu // manageGrannyAI.returnAIGranny() -> GameObject*
+// --- EnemyAIGranny: class AI Granny alternatif (offset field BERBEDA!) ---
+#define RVA_ENEMY_FIXEDUPDATE 0x1F4AB00u // EnemyAIGranny.FixedUpdate
+#define OFF_ENEMY_EYE         0x28u      // EnemyAIGranny.grannyEye (Transform)
+#define OFF_ENEMY_MYTRANSFORM 0x20u      // EnemyAIGranny.myTransform (Transform)
 
 // --- Field offset AIGrannyController (dump.cs) ---
 #define OFF_MY_TRANSFORM  0x78u
@@ -91,7 +99,14 @@ static pthread_t g_thread;
 static bool      g_threadRunning = false;
 
 // Instance Granny yang sedang hidup (di-cache dari hook FixedUpdate)
+// CATATAN: di game ini AIGrannyController bisa nempel di karakter USER sendiri
+// (terbukti: grannyEye-nya menempel di kamera). Instance milik user di-skip
+// via is_own_instance(); NPC asli dicari via manageGrannyAI / EnemyAIGranny.
 static void *g_grannyInstance = nullptr;
+// manageGrannyAI instance (punya referensi langsung ke GameObject NPC Granny)
+static void *g_grannyManager = nullptr;
+// EnemyAIGranny instance (class AI alternatif)
+static void *g_enemyGrannyInstance = nullptr;
 // Function pointer (semua dipanggil dengan method=NULL eksplisit)
 // UnityEngine.Transform.get_position()
 static Vector3 (*orig_get_position)(void *transform, void *method) = nullptr;
@@ -104,6 +119,10 @@ static void *(*orig_get_transform)(void *component, void *method) = nullptr;
 static void *(*orig_cam_get_main)(void *method) = nullptr;
 // UnityEngine.Camera.WorldToScreenPoint(Vector3) -> Vector3 layar (x, y, z=depth)
 static Vector3 (*orig_world_to_screen)(void *camera, Vector3 pos, void *method) = nullptr;
+// manageGrannyAI.returnAIGranny() -> GameObject* NPC Granny
+static void *(*orig_returnAIGranny)(void *mgr, void *method) = nullptr;
+// UnityEngine.GameObject.get_transform() -> Transform milik GameObject-nya
+static void *(*orig_go_get_transform)(void *go, void *method) = nullptr;
 static bool g_hooksInstalled = false;
 
 // Cache main camera (di-refresh tiap 2 detik, kamera bisa ganti saat pindah scene)
@@ -153,6 +172,21 @@ void hook_OnDisable(void *instance) {
     if (old_OnDisable) old_OnDisable(instance);
 }
 
+// manageGrannyAI.Awake: tangkap manager NPC Granny
+void (*old_MgrAwake)(void *instance);
+void hook_MgrAwake(void *instance) {
+    g_grannyManager = instance;
+    LOGI("GrannyESP: manageGrannyAI tertangkap: %p", instance);
+    if (old_MgrAwake) old_MgrAwake(instance);
+}
+
+// EnemyAIGranny.FixedUpdate: tangkap instance AI Granny alternatif
+void (*old_EnemyFixedUpdate)(void *instance);
+void hook_EnemyFixedUpdate(void *instance) {
+    g_enemyGrannyInstance = instance;
+    if (old_EnemyFixedUpdate) old_EnemyFixedUpdate(instance);
+}
+
 static void install_hook(void *addr, void *replace, void **orig) {
 #if defined(__aarch64__)
     A64HookFunction(addr, replace, orig);
@@ -176,6 +210,14 @@ void GrannyESP_InstallHooks() {
                  (void *) hook_FixedUpdate, (void **) &old_FixedUpdate);
     install_hook((void *) (base + RVA_ONDISABLE),
                  (void *) hook_OnDisable, (void **) &old_OnDisable);
+    install_hook((void *) (base + RVA_MGR_AWAKE),
+                 (void *) hook_MgrAwake, (void **) &old_MgrAwake);
+    install_hook((void *) (base + RVA_ENEMY_FIXEDUPDATE),
+                 (void *) hook_EnemyFixedUpdate, (void **) &old_EnemyFixedUpdate);
+    orig_returnAIGranny =
+        (void *(*)(void *, void *)) (base + RVA_MGR_RETURN_GRANNY);
+    orig_go_get_transform =
+        (void *(*)(void *, void *)) (base + RVA_GO_GET_TRANSFORM);
     orig_get_position =
         (Vector3 (*)(void *, void *)) (base + RVA_GET_POSITION);
     orig_get_transform =
@@ -271,44 +313,117 @@ static bool verify_instance(void *granny, std::string &warnMsg) {
 // Hasil resolusi posisi Granny
 struct GrannyPos {
     Vector3 wp;
-    const char *src; // "EYE" | "78" | "T0" | "?"
+    const char *src; // "NPC" | "EYE2" | "EYE" | "78" | "T0" | "?"
     bool ok;
 };
 
-// Posisi Granny diambil dari instance AI yang HIDUP (FixedUpdate jalan tiap
-// frame). Prioritas:
-//   EYE = field grannyEye (0x80) — Transform di kepala/mata Granny.
-//         Titik ESP di kepala = nametag pas di atas kepala, garis mengikuti
-//         kemanapun Granny bergerak.
-//   78  = field myTransform (fallback)
-//   T0  = get_transform(instance AI) (fallback terakhir)
+// Posisi kamera (== posisi user) untuk filter & jarak
+static void *get_camera_cached(); // forward decl
+static bool get_camera_pos(Vector3 *outWp) {
+    void *cam = get_camera_cached();
+    if (!cam || !orig_get_transform || !orig_get_position) return false;
+    void *t = orig_get_transform(cam, nullptr); // Camera adalah Component
+    if (!t) return false;
+    *outWp = orig_get_position(t, nullptr);
+    return true;
+}
+
+// True bila instance AIGrannyController ini milik USER sendiri (bukan NPC):
+// grannyEye-nya menempel di kamera (< 1m). Instance milik user di-skip
+// agar ESP tidak melacak diri sendiri.
+static bool is_own_instance(void *aiInstance) {
+    if (!aiInstance || !orig_get_position) return false;
+    void *tEye = read_ptr(aiInstance, OFF_GRANNY_EYE);
+    if (!tEye) return false;
+    Vector3 eyeWp = orig_get_position(tEye, nullptr);
+    Vector3 camWp;
+    if (!get_camera_pos(&camWp)) return false;
+    float dx = eyeWp.x - camWp.x, dy = eyeWp.y - camWp.y, dz = eyeWp.z - camWp.z;
+    return (dx*dx + dy*dy + dz*dz) < 1.0f; // < 1m dari kamera = milik user
+}
+
+// Sanity check posisi dunia (tolak NaN / nilai absurd dari pointer basi)
+static bool sane_pos(Vector3 wp) {
+    if (wp.x != wp.x || wp.y != wp.y || wp.z != wp.z) return false; // NaN
+    return fabsf(wp.x) < 10000 && fabsf(wp.y) < 10000 && fabsf(wp.z) < 10000;
+}
+
+// Posisi Granny (NPC). Prioritas:
+//   NPC  = via manageGrannyAI.returnAIGranny() -> GameObject NPC langsung
+//          dari manager game (paling akurat, tak peduli class AI-nya apa)
+//   EYE2 = EnemyAIGranny.grannyEye (0x28) — class AI alternatif
+//   EYE  = AIGrannyController.grannyEye (0x80), TAPI hanya bila BUKAN
+//          milik user sendiri (filter via is_own_instance)
+//   78/T0= fallback dari instance AI yang sama (juga difilter)
 static GrannyPos resolve_granny_pos() {
     GrannyPos r = { {0, 0, 0}, "?", false };
     if (!orig_get_position) return r;
+
+    // 1. NPC langsung dari manager
+    if (g_grannyManager && orig_returnAIGranny && orig_go_get_transform) {
+        void *go = orig_returnAIGranny(g_grannyManager, nullptr);
+        if (go) {
+            void *t = orig_go_get_transform(go, nullptr);
+            if (t) {
+                Vector3 wp = orig_get_position(t, nullptr);
+                if (sane_pos(wp)) {
+                    r.wp = wp; r.src = "NPC"; r.ok = true; return r;
+                }
+            }
+        }
+    }
+
+    // 2. EnemyAIGranny (offset grannyEye 0x28!)
+    if (g_enemyGrannyInstance) {
+        void *t = read_ptr(g_enemyGrannyInstance, OFF_ENEMY_EYE);
+        if (t) {
+            Vector3 wp = orig_get_position(t, nullptr);
+            if (sane_pos(wp)) { r.wp = wp; r.src = "EYE2"; r.ok = true; return r; }
+        }
+        t = read_ptr(g_enemyGrannyInstance, OFF_ENEMY_MYTRANSFORM);
+        if (t) {
+            Vector3 wp = orig_get_position(t, nullptr);
+            if (sane_pos(wp)) { r.wp = wp; r.src = "E78"; r.ok = true; return r; }
+        }
+    }
+
+    // 3. AIGrannyController — skip bila milik user sendiri
     void *granny = g_grannyInstance;
-    if (!granny) return r;
-
-    void *t = read_ptr(granny, OFF_GRANNY_EYE);
-    if (t) { r.wp = orig_get_position(t, nullptr); r.src = "EYE"; r.ok = true; return r; }
-
-    t = read_ptr(granny, OFF_MY_TRANSFORM);
-    if (t) { r.wp = orig_get_position(t, nullptr); r.src = "78"; r.ok = true; return r; }
-
-    if (orig_get_transform) {
-        t = orig_get_transform(granny, nullptr);
-        if (t) { r.wp = orig_get_position(t, nullptr); r.src = "T0"; r.ok = true; return r; }
+    if (granny && !is_own_instance(granny)) {
+        void *t = read_ptr(granny, OFF_GRANNY_EYE);
+        if (t) {
+            Vector3 wp = orig_get_position(t, nullptr);
+            if (sane_pos(wp)) { r.wp = wp; r.src = "EYE"; r.ok = true; return r; }
+        }
+        t = read_ptr(granny, OFF_MY_TRANSFORM);
+        if (t) {
+            Vector3 wp = orig_get_position(t, nullptr);
+            if (sane_pos(wp)) { r.wp = wp; r.src = "78"; r.ok = true; return r; }
+        }
+        if (orig_get_transform) {
+            t = orig_get_transform(granny, nullptr);
+            if (t) {
+                Vector3 wp = orig_get_position(t, nullptr);
+                if (sane_pos(wp)) { r.wp = wp; r.src = "T0"; r.ok = true; return r; }
+            }
+        }
     }
     return r;
 }
 
-// Panel debug: class + status grannyEye + sumber posisi + koordinat dunia/layar.
+// Panel debug: status manager/NPC/instance + sumber posisi + koordinat.
 static std::string build_debug_text() {
     char buf[512];
-    void *granny = g_grannyInstance;
-    if (!granny) { snprintf(buf, sizeof(buf), "DBG Granny\ninstance: null"); return buf; }
-    int n = snprintf(buf, sizeof(buf), "DBG Granny\ncls=%s\neye:%s",
-             get_class_name(granny),
-             read_ptr(granny, OFF_GRANNY_EYE) ? "1" : "0");
+    // Cek NPC via manager (tanpa resolve penuh, biar ringan)
+    const char *npcState = "-";
+    if (g_grannyManager && orig_returnAIGranny) {
+        npcState = orig_returnAIGranny(g_grannyManager, nullptr) ? "1" : "0";
+    }
+    int n = snprintf(buf, sizeof(buf), "DBG Granny\nmgr:%s npc:%s\nenemy:%s own:%s",
+             g_grannyManager ? "1" : "0",
+             npcState,
+             g_enemyGrannyInstance ? "1" : "0",
+             (g_grannyInstance && is_own_instance(g_grannyInstance)) ? "1" : "0");
     if (n > 0 && (size_t) n < sizeof(buf) - 128 &&
         orig_cam_get_main && orig_world_to_screen) {
         GrannyPos gp = resolve_granny_pos();
@@ -332,30 +447,20 @@ static std::string build_debug_text() {
 }
 
 static std::string build_panel_text() {
-    void *granny = g_grannyInstance; // snapshot sekali
-    std::string warn;
-    if (!verify_instance(granny, warn)) return warn;
-    if (!orig_get_position) return "Granny\nhook belum siap";
-
-    // Posisi Granny dari resolver (prioritas: grannyEye -> 78 -> T0).
+    // Posisi NPC Granny dari resolver (prioritas: manager NPC -> EnemyAIGranny
+    // -> AIGrannyController yang bukan milik user).
     GrannyPos gp = resolve_granny_pos();
-    // Posisi pemain: coba player(0x130) -> playerPos(0x140) -> target(0x90),
-    // pakai yang pertama non-null (field target bisa null tergantung state AI).
-    void *tPlayer = read_ptr(granny, OFF_PLAYER);
-    if (!tPlayer) tPlayer = read_ptr(granny, 0x140u);
-    if (!tPlayer) tPlayer = read_ptr(granny, 0x90u);
-    if (!gp.ok || !tPlayer) return "Granny\nmenunggu data...";
+    // Posisi user = posisi kamera.
+    Vector3 userWp;
+    if (!gp.ok || !get_camera_pos(&userWp)) return "Granny\nmenunggu data...";
 
     Vector3 pg = gp.wp;
-    Vector3 pp = orig_get_position(tPlayer, nullptr);
-    float dx = pg.x - pp.x, dy = pg.y - pp.y, dz = pg.z - pp.z;
+    float dx = pg.x - userWp.x, dy = pg.y - userWp.y, dz = pg.z - userWp.z;
     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-    bool seen = false;
-    memcpy(&seen, (void *) ((uintptr_t) granny + OFF_SEE_PLAYER), sizeof(seen));
 
     char buf[128];
-    snprintf(buf, sizeof(buf), "Granny (%s)\nJarak: %.1f m\n%s",
-             gp.src, dist, seen ? "TERLIHAT!" : "aman");
+    snprintf(buf, sizeof(buf), "Granny (%s)\nJarak: %.1f m",
+             gp.src, dist);
     return buf;
 }
 
