@@ -96,6 +96,49 @@ static void *g_grannyInstance = nullptr;
 // visual Granny (tak satu pun titik T0/78/130/140/90 menempel di badannya),
 // jadi posisi ESP harus diambil dari objek visual ini.
 static void *g_visualGranny = nullptr;
+
+// Pelacakan SEMUA instance (bukan hanya yang terakhir): game bisa me-respawn
+// Granny (objek lama di-destroy, Start/FixedUpdate tak lagi dipanggil untuknya)
+// sehingga pointer tunggal bisa basi tanpa disadari. Dengan melacak semuanya
+// + timestamp terakhir aktif, kita bisa pilih yang PALING SEGAR dan melihat
+// di debug ada berapa Granny yang pernah hidup.
+#define MAX_TRACK 6
+struct TrackedInst {
+    void *inst;
+    uint64_t lastMs; // terakhir FixedUpdate (AI) / Start (visual)
+};
+static TrackedInst g_aiTrack[MAX_TRACK];
+static int g_aiTrackCount = 0;
+static TrackedInst g_visTrack[MAX_TRACK];
+static int g_visTrackCount = 0;
+
+static void touch_track(TrackedInst *arr, int *count, void *inst, uint64_t now) {
+    for (int i = 0; i < *count; i++) {
+        if (arr[i].inst == inst) { arr[i].lastMs = now; return; }
+    }
+    if (*count < MAX_TRACK) {
+        arr[*count].inst = inst;
+        arr[*count].lastMs = now;
+        (*count)++;
+    } else {
+        // Penuh: timpa yang paling basi
+        int oldest = 0;
+        for (int i = 1; i < *count; i++)
+            if (arr[i].lastMs < arr[oldest].lastMs) oldest = i;
+        arr[oldest].inst = inst;
+        arr[oldest].lastMs = now;
+    }
+}
+
+static void untouch_track(TrackedInst *arr, int *count, void *inst) {
+    for (int i = 0; i < *count; i++) {
+        if (arr[i].inst == inst) {
+            arr[i] = arr[*count - 1];
+            (*count)--;
+            return;
+        }
+    }
+}
 // Function pointer (semua dipanggil dengan method=NULL eksplisit)
 // UnityEngine.Transform.get_position()
 static Vector3 (*orig_get_position)(void *transform, void *method) = nullptr;
@@ -147,15 +190,18 @@ static uintptr_t libil2cpp_base() {
 // ---------------------------------------------------------------------------
 void (*old_FixedUpdate)(void *instance);
 void hook_FixedUpdate(void *instance) {
+    touch_track(g_aiTrack, &g_aiTrackCount, instance, now_ms());
     g_grannyInstance = instance; // Granny hidup & aktif -> simpan
     if (old_FixedUpdate) old_FixedUpdate(instance);
 }
 
 void (*old_OnDisable)(void *instance);
 void hook_OnDisable(void *instance) {
+    untouch_track(g_aiTrack, &g_aiTrackCount, instance);
     if (g_grannyInstance == instance) {
         g_grannyInstance = nullptr; // cegah dangling
-        g_visualGranny = nullptr;   // visual kemungkinan ikut di-destroy
+        // visual TIDAK dibuang dari track (biar terlihat di debug bila basi),
+        // primary visual selalu di-resolve via freshest_visual()
     }
     if (old_OnDisable) old_OnDisable(instance);
 }
@@ -165,8 +211,10 @@ void hook_OnDisable(void *instance) {
 // jadi hook terpasang sebelum Granny pertama spawn.
 void (*old_VisualStart)(void *instance);
 void hook_VisualStart(void *instance) {
+    touch_track(g_visTrack, &g_visTrackCount, instance, now_ms());
     g_visualGranny = instance;
-    LOGI("GrannyESP: visual Granny tertangkap: %p", instance);
+    LOGI("GrannyESP: visual Granny tertangkap: %p (total %d)",
+         instance, g_visTrackCount);
     if (old_VisualStart) old_VisualStart(instance);
 }
 
@@ -287,15 +335,38 @@ static bool verify_instance(void *granny, std::string &warnMsg) {
     return true;
 }
 
-// Kembalikan g_visualGranny bila class-nya masih GrannyChangeTexture.
-// Bila tidak cocok (RVA salah versi / pointer basi) -> buang & kembalikan null.
-static void *valid_visual() {
-    void *vis = g_visualGranny;
-    if (!vis) return nullptr;
-    const char *vc = get_class_name(vis);
-    if (vc && strcmp(vc, "GrannyChangeTexture") == 0) return vis;
-    g_visualGranny = nullptr;
-    return nullptr;
+// Instance AI yang FixedUpdate-nya PALING BARU (yang benar-benar hidup).
+// Mengatasi kasus respawn: instance lama yang sudah di-destroy tidak dipilih.
+static void *freshest_ai(uint64_t *outAgeMs) {
+    void *best = nullptr;
+    uint64_t bestMs = 0;
+    for (int i = 0; i < g_aiTrackCount; i++) {
+        if (g_aiTrack[i].lastMs > bestMs) {
+            bestMs = g_aiTrack[i].lastMs;
+            best = g_aiTrack[i].inst;
+        }
+    }
+    if (outAgeMs) *outAgeMs = best ? now_ms() - bestMs : (uint64_t) -1;
+    return best;
+}
+
+// Instance visual yang Start-nya PALING BARU + class-nya masih valid.
+// Class check tiap pakai: antisipasi RVA salah versi / pointer basi.
+static void *freshest_visual(uint64_t *outAgeMs) {
+    void *best = nullptr;
+    uint64_t bestMs = 0;
+    for (int i = 0; i < g_visTrackCount; i++) {
+        void *vis = g_visTrack[i].inst;
+        const char *vc = get_class_name(vis);
+        if (!vc || strcmp(vc, "GrannyChangeTexture") != 0) continue;
+        if (g_visTrack[i].lastMs > bestMs) {
+            bestMs = g_visTrack[i].lastMs;
+            best = vis;
+        }
+    }
+    if (outAgeMs) *outAgeMs = best ? now_ms() - bestMs : (uint64_t) -1;
+    g_visualGranny = best;
+    return best;
 }
 
 // Hasil resolusi posisi Granny
@@ -306,15 +377,15 @@ struct GrannyPos {
 };
 
 // Prioritas sumber posisi (yang pertama berhasil dipakai):
-//   VB = Renderer grannyBody milik objek VISUAL (paling akurat, mesh terlihat)
-//   V  = transform objek visual GrannyChangeTexture
-//   T0 = get_transform(instance AI)
+//   VB = Renderer grannyBody milik objek VISUAL paling segar (paling akurat)
+//   V  = transform objek visual paling segar
+//   T0 = get_transform(instance AI paling segar)
 //   78 = field myTransform (fallback terakhir)
 static GrannyPos resolve_granny_pos() {
     GrannyPos r = { {0, 0, 0}, "?", false };
     if (!orig_get_transform || !orig_get_position) return r;
 
-    void *vis = valid_visual();
+    void *vis = freshest_visual(nullptr);
     if (vis) {
         void *body = read_ptr(vis, OFF_VISUAL_BODY); // Renderer grannyBody
         void *t = body ? orig_get_transform(body, nullptr) : nullptr;
@@ -323,7 +394,7 @@ static GrannyPos resolve_granny_pos() {
         if (t) { r.wp = orig_get_position(t, nullptr); r.src = "V"; r.ok = true; return r; }
     }
 
-    void *granny = g_grannyInstance;
+    void *granny = freshest_ai(nullptr);
     if (granny) {
         void *t = orig_get_transform(granny, nullptr);
         if (t) { r.wp = orig_get_position(t, nullptr); r.src = "T0"; r.ok = true; return r; }
@@ -334,16 +405,25 @@ static GrannyPos resolve_granny_pos() {
 }
 
 // Panel debug: nama class + status null(0)/non-null(1) tiap offset kandidat
-// + sumber posisi aktif + koordinat dunia & layar.
+// + jumlah & freshness instance AI/visual + sumber posisi aktif + koordinat.
 static std::string build_debug_text() {
-    char buf[512];
-    void *granny = g_grannyInstance;
-    void *vis = valid_visual();
+    char buf[640];
+    uint64_t aiAgeMs = 0, visAgeMs = 0;
+    void *granny = freshest_ai(&aiAgeMs);
+    void *vis = freshest_visual(&visAgeMs);
     if (!granny && !vis) { snprintf(buf, sizeof(buf), "DBG Granny\ninstance: null"); return buf; }
     auto nz = [](void *p) -> const char * { return p ? "1" : "0"; };
-    int n = snprintf(buf, sizeof(buf), "DBG Granny\ncls=%s\nvis=%s\n78:%s 130:%s\n140:%s 90:%s",
+    // age: detik sejak FixedUpdate/Start terakhir; "-" bila tak ada instance
+    char aiAge[16], visAge[16];
+    if (granny) snprintf(aiAge, sizeof(aiAge), "%llus", (unsigned long long)(aiAgeMs / 1000));
+    else snprintf(aiAge, sizeof(aiAge), "-");
+    if (vis) snprintf(visAge, sizeof(visAge), "%llus", (unsigned long long)(visAgeMs / 1000));
+    else snprintf(visAge, sizeof(visAge), "-");
+    int n = snprintf(buf, sizeof(buf),
+             "DBG Granny\ncls=%s\nai=%d(%s) vis=%d(%s)\n78:%s 130:%s\n140:%s 90:%s",
              granny ? get_class_name(granny) : "-",
-             vis ? get_class_name(vis) : "-",
+             g_aiTrackCount, aiAge,
+             g_visTrackCount, visAge,
              granny ? nz(read_ptr(granny, OFF_MY_TRANSFORM)) : "-",
              granny ? nz(read_ptr(granny, OFF_PLAYER)) : "-",
              granny ? nz(read_ptr(granny, 0x140u)) : "-",   // playerPos
@@ -370,7 +450,7 @@ static std::string build_debug_text() {
 }
 
 static std::string build_panel_text() {
-    void *granny = g_grannyInstance; // snapshot sekali
+    void *granny = freshest_ai(nullptr); // instance AI paling segar
     std::string warn;
     if (!verify_instance(granny, warn)) return warn;
     if (!orig_get_position) return "Granny\nhook belum siap";
@@ -493,52 +573,69 @@ static void *get_camera_cached() {
 }
 
 // Mode debug: proyeksikan SEMUA kandidat transform jadi titik berlabel:
-//   VB  = Renderer grannyBody visual   (magenta)
-//   V   = transform objek visual       (oranye)
+//   V1..V3 = Renderer grannyBody tiap instance visual (magenta/pink/ungu)
 //   T0  = get_transform(instance AI)   (merah)
 //   78  = field myTransform            (kuning)
 //   130 = field player                 (cyan)
 //   140 = field playerPos              (hijau)
 //   90  = field target                 (putih)
 // Titik yang menempel di badan Granny = sumber posisi yang benar.
+// Bila ada >1 titik V, berarti ada beberapa objek visual (respawn) —
+// yang menempel di badan = instance yang hidup.
 static void draw_debug_candidates(JNIEnv *env) {
-    void *granny = g_grannyInstance;
-    void *vis = valid_visual();
-    if ((!granny && !vis) || !orig_get_transform || !orig_get_position ||
-        !orig_world_to_screen) {
+    uint64_t aiAge = 0, visAge = 0;
+    void *granny = freshest_ai(&aiAge);
+    freshest_visual(&visAge); // sinkronkan g_visualGranny
+    if ((!granny && g_visTrackCount == 0) || !orig_get_transform ||
+        !orig_get_position || !orig_world_to_screen) {
         call_esp_multi(env, nullptr, 0); // kosongkan
         return;
     }
     void *cam = get_camera_cached();
     if (!cam) { call_esp_multi(env, nullptr, 0); return; }
 
-    // Kandidat dari objek visual
-    void *tVB = nullptr, *tV = nullptr;
-    if (vis) {
-        void *body = read_ptr(vis, OFF_VISUAL_BODY);
-        if (body) tVB = orig_get_transform(body, nullptr);
-        tV = orig_get_transform(vis, nullptr);
+    struct Cand { const char *label; void *t; int color; };
+    Cand cands[8];
+    int nc = 0;
+
+    // Tiap instance visual: titik dari Renderer grannyBody-nya
+    static const char *vlabels[3] = { "V1", "V2", "V3" };
+    static const int vcolors[3] = { (int) 0xFFFF00FF, (int) 0xFFFF80AB,
+                                    (int) 0xFFCE93D8 };
+    int nv = g_visTrackCount < 3 ? g_visTrackCount : 3;
+    for (int i = 0; i < nv; i++) {
+        void *v = g_visTrack[i].inst;
+        const char *vc = get_class_name(v);
+        if (!vc || strcmp(vc, "GrannyChangeTexture") != 0) continue;
+        void *body = read_ptr(v, OFF_VISUAL_BODY);
+        void *t = body ? orig_get_transform(body, nullptr) : nullptr;
+        if (!t) t = orig_get_transform(v, nullptr);
+        if (t && nc < 8) {
+            cands[nc].label = vlabels[i];
+            cands[nc].t = t;
+            cands[nc].color = vcolors[i];
+            nc++;
+        }
     }
 
-    struct Cand { const char *label; void *t; int color; };
-    Cand cands[7] = {
-        { "VB",  tVB,                                 (int) 0xFFFF00FF },
-        { "V",   tV,                                  (int) 0xFFFF9800 },
-        { "T0",  granny ? orig_get_transform(granny, nullptr) : nullptr,
-                                                         (int) 0xFFFF5252 },
-        { "78",  granny ? read_ptr(granny, OFF_MY_TRANSFORM) : nullptr,
-                                                         (int) 0xFFFFFF00 },
-        { "130", granny ? read_ptr(granny, OFF_PLAYER) : nullptr,
-                                                         (int) 0xFF00FFFF },
-        { "140", granny ? read_ptr(granny, 0x140u) : nullptr,
-                                                         (int) 0xFF00FF00 },
-        { "90",  granny ? read_ptr(granny, 0x90u) : nullptr,
-                                                         (int) 0xFFFFFFFF },
-    };
-    DbgPt pts[7];
+    // Kandidat dari instance AI paling segar
+    if (granny && nc < 8) {
+        Cand ai[5] = {
+            { "T0",  orig_get_transform(granny, nullptr), (int) 0xFFFF5252 },
+            { "78",  read_ptr(granny, OFF_MY_TRANSFORM),  (int) 0xFFFFFF00 },
+            { "130", read_ptr(granny, OFF_PLAYER),        (int) 0xFF00FFFF },
+            { "140", read_ptr(granny, 0x140u),            (int) 0xFF00FF00 },
+            { "90",  read_ptr(granny, 0x90u),             (int) 0xFFFFFFFF },
+        };
+        for (int i = 0; i < 5 && nc < 8; i++) {
+            if (!ai[i].t) continue;
+            cands[nc++] = ai[i];
+        }
+    }
+
+    DbgPt pts[8];
     int n = 0;
-    for (int i = 0; i < 7; i++) {
-        if (!cands[i].t) continue;
+    for (int i = 0; i < nc; i++) {
         Vector3 wp = orig_get_position(cands[i].t, nullptr);
         Vector3 sp = orig_world_to_screen(cam, wp, nullptr);
         if (sp.z < 1.0f) continue; // di belakang kamera
