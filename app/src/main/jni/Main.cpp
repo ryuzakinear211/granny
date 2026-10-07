@@ -113,6 +113,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
             OBFUSCATE("Toggle_Show NPC Granny"),//case 0
             OBFUSCATE("Toggle_Enable ESP"),//case 1
             OBFUSCATE("Toggle_Debug Info Granny"),//case 2
+            OBFUSCATE("Toggle_Kepala Besar Granny"),//case 3
            
     };
 
@@ -147,6 +148,9 @@ void Changes(JNIEnv *env, jclass clazz, jobject obj,
             break;
         case 2: // Toggle_Debug Info Granny
             GrannyESP_SetDebug(boolean);
+            break;
+        case 3: // Toggle_Kepala Besar Granny
+            GrannyESP_SetBigHead(boolean);
             break;
     }
 }

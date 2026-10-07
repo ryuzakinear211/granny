@@ -38,6 +38,9 @@ void GrannyESP_SetDebug(bool enabled);
 // Toggle "Enable ESP": overlay gambar (line + nametag) di dalam game.
 void GrannyESP_SetESP(bool enabled);
 
+// Toggle "Kepala Besar Granny": scale up tulang kepala Granny (client-side).
+void GrannyESP_SetBigHead(bool enabled);
+
 #ifdef __cplusplus
 }
 #endif

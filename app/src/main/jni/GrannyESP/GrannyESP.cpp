@@ -61,6 +61,8 @@
 #define RVA_CAM_GET_MAIN  0x3FA83A0u  // UnityEngine.Camera.get_main()
 #define RVA_W2S           0x3FA8118u  // UnityEngine.Camera.WorldToScreenPoint(Vector3)
 #define RVA_GO_GET_TRANSFORM 0x3FE3E70u // UnityEngine.GameObject.get_transform
+#define RVA_TR_GET_PARENT    0x3FF1F2Cu // UnityEngine.Transform.get_parent()
+#define RVA_TR_SET_LOCALSCALE 0x3FF28A4u // UnityEngine.Transform.set_localScale(Vector3)
 // --- manageGrannyAI: manager NPC Granny (mode PvE) ---
 #define RVA_MGR_AWAKE         0x1FF6F44u // manageGrannyAI.Awake
 #define RVA_MGR_RETURN_GRANNY 0x1FF6F3Cu // manageGrannyAI.returnAIGranny() -> GameObject*
@@ -139,6 +141,10 @@ static Vector3 (*orig_world_to_screen)(void *camera, Vector3 pos, void *method) 
 static void *(*orig_returnAIGranny)(void *mgr, void *method) = nullptr;
 // UnityEngine.GameObject.get_transform() -> Transform milik GameObject-nya
 static void *(*orig_go_get_transform)(void *go, void *method) = nullptr;
+// UnityEngine.Transform.get_parent() -> Transform parent
+static void *(*orig_get_parent)(void *transform, void *method) = nullptr;
+// UnityEngine.Transform.set_localScale(Vector3)
+static void (*orig_set_localScale)(void *transform, Vector3 scale, void *method) = nullptr;
 static bool g_hooksInstalled = false;
 
 // Cache main camera (di-refresh tiap 2 detik, kamera bisa ganti saat pindah scene)
@@ -289,6 +295,10 @@ void GrannyESP_InstallHooks() {
         (void *(*)(void *, void *)) (base + RVA_MGR_RETURN_GRANNY);
     orig_go_get_transform =
         (void *(*)(void *, void *)) (base + RVA_GO_GET_TRANSFORM);
+    orig_get_parent =
+        (void *(*)(void *, void *)) (base + RVA_TR_GET_PARENT);
+    orig_set_localScale =
+        (void (*)(void *, Vector3, void *)) (base + RVA_TR_SET_LOCALSCALE);
     orig_get_position =
         (Vector3 (*)(void *, void *)) (base + RVA_GET_POSITION);
     orig_get_transform =
@@ -729,6 +739,49 @@ void GrannyESP_SetESP(bool enabled) {
 void GrannyESP_SetDebug(bool enabled) {
     g_debug = enabled;
     LOGI("GrannyESP: debug %s", enabled ? "ON" : "OFF");
+}
+
+// Kepala Besar Granny (client-side): scale up parent dari grannyEye
+// (tulang kepala) sebesar 2.5x. Dipanggil dari toggle (thread UI Java).
+// Mencari dari semua sumber AI yang terlacak.
+void GrannyESP_SetBigHead(bool enabled) {
+    if (!orig_get_parent || !orig_set_localScale) {
+        LOGE("GrannyESP: big head gagal (function pointer belum siap)");
+        return;
+    }
+    float s = enabled ? 2.5f : 1.0f;
+    Vector3 scale = { s, s, s };
+    int count = 0;
+
+    // Helper: scale parent dari eye Transform
+    auto scale_head = [&](void *eye, unsigned eyeOff) {
+        // eyeOff tidak dipakai di sini; eye sudah Transform langsung
+        (void) eyeOff;
+        if (!eye) return;
+        void *head = orig_get_parent(eye, nullptr);
+        if (!head) return;
+        orig_set_localScale(head, scale, nullptr);
+        count++;
+    };
+
+    // 1. EnemyAIGranny.grannyEye (0x28)
+    if (g_enemyGrannyInstance) {
+        void *eye = read_ptr(g_enemyGrannyInstance, OFF_ENEMY_EYE);
+        scale_head(eye, 0);
+    }
+    // 2. Semua instance AIGrannyController kecuali milik user
+    {
+        void *snap[MAX_AI_INSTANCES];
+        int sc = g_aiCount < MAX_AI_INSTANCES ? g_aiCount : MAX_AI_INSTANCES;
+        for (int i = 0; i < sc; i++) snap[i] = g_aiInstances[i];
+        for (int i = 0; i < sc; i++) {
+            void *ai = snap[i];
+            if (!ai || eye_at_camera(ai, OFF_AI_GRANNY_EYE)) continue;
+            void *eye = read_ptr(ai, OFF_AI_GRANNY_EYE);
+            scale_head(eye, 0);
+        }
+    }
+    LOGI("GrannyESP: big head %s (%d kepala)", enabled ? "ON" : "OFF", count);
 }
 
 // Dipanggil dari Changes() di Main.cpp (thread UI Java)
